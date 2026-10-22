@@ -265,7 +265,14 @@ pub fn parse_dhcp(frame: &[u8], mac: &Mac, xid: u32) -> Option<Dhcp> {
             (53, 1) => kind = v[0],
             (1, 4) => lease.mask = ip4(v),
             (3, l) if l >= 4 => lease.router = ip4(v),
-            (6, l) if l >= 4 => lease.dns = v.chunks_exact(4).map(ip4).collect(),
+            (6, l) if l >= 4 => {
+                lease.dns = v
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| Ipv4Addr::from(*c))
+                    .collect()
+            }
             (51, 4) => lease.lease_secs = u32::from_be_bytes(v.try_into().unwrap()),
             (54, 4) => lease.server = ip4(v),
             _ => {}
