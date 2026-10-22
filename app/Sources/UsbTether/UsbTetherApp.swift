@@ -9,6 +9,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     /// The phone last rendered in the approval prompt; never re-read at close time.
     private var displayedPrompt: PendingPhone?
+    /// Set when the system announces logout, restart or shutdown.
+    private var poweringOff = false
 
     static func main() {
         let app = NSApplication.shared
@@ -20,6 +22,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if activateOtherInstance() { exit(0) }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(willPowerOff(_:)), name: NSWorkspace.willPowerOffNotification, object: nil)
         showWindow()
     }
 
@@ -32,9 +36,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { await model.refresh() }
     }
 
+    @objc private func willPowerOff(_ notification: Notification) {
+        poweringOff = true
+    }
+
     /// Closing the window quits. If a prompt is on screen the close counts as "Not now" for
     /// that phone: it stays declined until the phone is replugged, and only then can it be
     /// approved. The decline gets at most one second so a stuck daemon cannot block quitting.
+    /// A quit for logout, restart or shutdown is not a "Not now": the daemon asks again at
+    /// the next login.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
     }
@@ -45,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        switch closeAction(displayedPrompt: displayedPrompt) {
+        switch closeAction(displayedPrompt: displayedPrompt, isSystemQuit: isSystemQuit()) {
         case .quit:
             return .terminateNow
         case .declineThenQuit(let phone):
@@ -65,6 +75,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             return .terminateLater
         }
+    }
+
+    /// Whether this quit comes from logout, restart or shutdown (the quit Apple event's
+    /// `kAEQuitReason`, or the workspace's power-off notification).
+    private func isSystemQuit() -> Bool {
+        let why = NSAppleEventManager.shared().currentAppleEvent?
+            .attributeDescriptor(forKeyword: kAEQuitReason)
+        return poweringOff
+            || isSystemQuitReason(why?.typeCodeValue)
+            || isSystemQuitReason(why?.enumCodeValue)
     }
 
     private func showWindow() {

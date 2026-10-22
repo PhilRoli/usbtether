@@ -10,7 +10,7 @@ struct ApprovalView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Approve \(phone.name) (\(Presentation.vidPid(vid: phone.vid, pid: phone.pid)))?")
                 .font(.headline)
-            if let serial = phone.serial {
+            if let serial = Presentation.displaySerial(phone.serial) {
                 Text("Serial: \(serial)")
                     .font(.callout)
             }

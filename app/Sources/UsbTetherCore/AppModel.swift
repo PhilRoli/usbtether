@@ -53,10 +53,11 @@ public final class AppModel: ObservableObject {
             switch error {
             case .unavailable:
                 status = nil
-                problem = "usbtetherd is not running. Install it with: brew install --cask usbtether"
+                problem = "usbtetherd is not running. Reinstall it with: brew reinstall --cask usbtether"
             case .refused(let message):
-                problem = "usbtetherd refused the request (\(message)). "
-                    + "Only administrator accounts can approve phones."
+                // The daemon answers exactly "not allowed" to a peer that is neither root nor admin.
+                problem = "usbtetherd refused the request (\(message))."
+                    + (message == "not allowed" ? " Only administrator accounts can approve phones." : "")
             case .timedOut:
                 problem = "usbtetherd did not answer in time. Try again."
             case .badReply:

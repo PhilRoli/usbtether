@@ -190,7 +190,7 @@ final class AppModelTests: XCTestCase {
         await model.refresh()
         XCTAssertNil(model.status)
         XCTAssertEqual(model.problem,
-                       "usbtetherd is not running. Install it with: brew install --cask usbtether")
+                       "usbtetherd is not running. Reinstall it with: brew reinstall --cask usbtether")
     }
 
     func testRefusedReplySetsProblem() async {
@@ -198,6 +198,12 @@ final class AppModelTests: XCTestCase {
         await model.refresh()
         XCTAssertEqual(model.problem,
                        "usbtetherd refused the request (not allowed). Only administrator accounts can approve phones.")
+    }
+
+    func testOtherRefusalDoesNotBlameTheAccount() async {
+        let model = AppModel(client: FakeClient(.failure(.refused("store write failed: disk full"))))
+        await model.refresh()
+        XCTAssertEqual(model.problem, "usbtetherd refused the request (store write failed: disk full).")
     }
 
     func testBadReplySetsProblem() async {

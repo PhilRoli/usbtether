@@ -32,7 +32,8 @@ public struct ApprovedPhone: Decodable, Identifiable, Equatable, Sendable {
     public let serial: String?
     public let approvedAt: Int
 
-    public var id: String { "\(vid):\(pid):\(serial ?? "")" }
+    /// Distinct for a missing and an empty serial.
+    public var id: String { "\(vid):\(pid):" + (serial.map { "=" + $0 } ?? "-") }
 
     public init(name: String, vid: Int, pid: Int, serial: String?, approvedAt: Int) {
         self.name = name
