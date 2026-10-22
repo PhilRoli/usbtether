@@ -4,6 +4,10 @@ A trimmed fork of [rtether](https://github.com/nkazbekov/rtether) (MIT OR Apache
 
 Status: under construction.
 
+## Releasing
+
+Push a `vX.Y.Z` tag: the Release workflow tests, packages a universal build, publishes the GitHub release and updates the Homebrew cask in `PhilRoli/homebrew-tap`. Prerelease tags such as `v1.2.0-rc.1` publish a GitHub prerelease but skip the tap. Dependency bumps merged by Dependabot ship with the next manual tag.
+
 ## License
 
 MIT OR Apache-2.0, see `LICENSE-MIT` and `LICENSE-APACHE`.
