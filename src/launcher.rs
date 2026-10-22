@@ -4,9 +4,13 @@
 
 use std::io;
 use std::os::unix::fs::MetadataExt;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 const APP_PATH: &str = "/Applications/UsbTether.app";
+/// A hung launchctl/sudo/open must not stall the supervisor (no scans, no
+/// prompts) or the shutdown join for longer than this.
+const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Owner of `/dev/console`: the user at the screen. `None` at the login
 /// window (owner is root) or if it cannot be read.
@@ -43,14 +47,37 @@ pub fn launch_argv(uid: u32) -> Vec<String> {
     ]
 }
 
-pub fn launch_app(uid: u32) -> io::Result<()> {
-    let argv = launch_argv(uid);
-    let status = Command::new(&argv[0])
-        .args(&argv[1..])
+/// Run `cmd` with stdio closed, waiting at most `timeout`; a child that is
+/// still running then is killed and reaped.
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> io::Result<ExitStatus> {
+    let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()?;
+        .spawn()?;
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{:?} did not finish within {timeout:?}; killed it",
+                    cmd.get_program()
+                ),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub fn launch_app(uid: u32) -> io::Result<()> {
+    let argv = launch_argv(uid);
+    let status = run_with_timeout(Command::new(&argv[0]).args(&argv[1..]), LAUNCH_TIMEOUT)?;
     if status.success() {
         Ok(())
     } else {
@@ -80,6 +107,24 @@ mod tests {
         assert!(should_launch(Some(502), Some(501), false, true));
         assert!(!should_launch(Some(501), Some(501), false, true));
         assert!(!should_launch(None, Some(501), false, false));
+    }
+
+    #[test]
+    fn wait_with_timeout_reports_the_exit_status() {
+        let ok = run_with_timeout(&mut Command::new("/usr/bin/true"), Duration::from_secs(5));
+        assert!(ok.unwrap().success());
+        let bad = run_with_timeout(&mut Command::new("/usr/bin/false"), Duration::from_secs(5));
+        assert!(!bad.unwrap().success());
+    }
+
+    #[test]
+    fn hung_child_is_killed_after_the_timeout() {
+        let start = std::time::Instant::now();
+        let mut cmd = Command::new("/bin/sleep");
+        cmd.arg("30");
+        let e = run_with_timeout(&mut cmd, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
