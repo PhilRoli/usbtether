@@ -1,0 +1,219 @@
+name: Release
+
+# Releases come from three places:
+#  - a pushed v* tag (manual minor/major releases by the owner)
+#  - a successful CI run on main whose head commit changed Cargo.lock or
+#    app/Package.resolved (automatic patch release for dependency bumps)
+#  - workflow_dispatch, which only ever does a dry run (package, no publish)
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Package only; never tag, release or touch the tap
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: release
+    if: >-
+      github.event_name != 'workflow_run' || (
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'main')
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      # Empty for non-workflow_run events, which falls back to the triggering ref.
+      # No credentials are persisted: build steps run dependency build scripts.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Plan release
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
+          skip() { echo "$1"; out release false; exit 0; }
+          stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'
+
+          case "$EVENT" in
+            push)
+              if [[ ! "$REF_NAME" =~ $tag_re ]]; then
+                echo "Tag $REF_NAME is not vMAJOR.MINOR.PATCH[-suffix]" >&2
+                exit 1
+              fi
+              mode=tag
+              tag="$REF_NAME"
+              version="${REF_NAME#v}"
+              ;;
+            workflow_run)
+              if ! parent="$(git rev-parse --verify --quiet "$HEAD_SHA^")"; then
+                skip "Root commit, no dependency change, skipping."
+              fi
+              changed="$(git diff --name-only "$parent" "$HEAD_SHA")"
+              if ! grep -Fxq -e Cargo.lock -e app/Package.resolved <<<"$changed"; then
+                skip "No dependency change (Cargo.lock, app/Package.resolved), skipping."
+              fi
+              head_tags="$(git tag --points-at "$HEAD_SHA")"
+              if grep -Eq "$stable_re" <<<"$head_tags"; then
+                skip "$HEAD_SHA is already tagged with a stable release tag, skipping."
+              fi
+              mode=auto
+              version="$(scripts/next-version.sh)"
+              tag="v$version"
+              ;;
+            workflow_dispatch)
+              if [ "$DRY_RUN" != "true" ]; then
+                echo "workflow_dispatch only supports dry runs; push a v* tag to release." >&2
+                exit 1
+              fi
+              mode=dry
+              version=0.0.0-dryrun
+              tag="v$version"
+              ;;
+            *)
+              echo "Unexpected event $EVENT" >&2
+              exit 1
+              ;;
+          esac
+
+          prerelease=false
+          [[ "$version" == *-* ]] && prerelease=true
+          tap=false
+          if [ "$mode" != dry ] && [ "$prerelease" = false ]; then tap=true; fi
+
+          echo "Release $tag (mode=$mode, prerelease=$prerelease, tap=$tap)"
+          out release true
+          out mode "$mode"
+          out version "$version"
+          out tag "$tag"
+          out prerelease "$prerelease"
+          out tap "$tap"
+
+      # Fail fast, before building anything, if the tap update cannot succeed.
+      - name: Verify tap token
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.tap == 'true' }}
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          [ -n "$TOKEN" ] || { echo "HOMEBREW_TAP_TOKEN is not set" >&2; exit 1; }
+
+      - name: Test daemon
+        if: ${{ steps.plan.outputs.release == 'true' }}
+        run: cargo test
+
+      - name: Test app
+        if: ${{ steps.plan.outputs.release == 'true' }}
+        run: swift test
+        working-directory: app
+
+      - name: Add Rust targets
+        if: ${{ steps.plan.outputs.release == 'true' }}
+        run: rustup target add x86_64-apple-darwin aarch64-apple-darwin
+
+      - name: Package app
+        id: package
+        if: ${{ steps.plan.outputs.release == 'true' }}
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          scripts/package.sh "$VERSION"
+          archive="build/UsbTether-$VERSION.zip"
+          [ -f "$archive" ] || { echo "$archive was not produced" >&2; exit 1; }
+          sha256="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+          echo "$archive"
+          echo "sha256: $sha256"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha256" >> "$GITHUB_OUTPUT"
+
+      # Prereleases and dry runs never reach the Homebrew tap.
+      - name: Checkout homebrew-tap
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.tap == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository_owner }}/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Verify cask
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.tap == 'true' }}
+        run: |
+          [ -f homebrew-tap/Casks/usbtether.rb ] || { echo "homebrew-tap/Casks/usbtether.rb not found" >&2; exit 1; }
+
+      # The auto path tags only now: the tap is reachable and the package built.
+      # A tag pushed with GITHUB_TOKEN does not trigger another workflow run.
+      - name: Create and push tag
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.mode == 'auto' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG" "$HEAD_SHA"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${REPO}.git" "refs/tags/$TAG"
+
+      - name: Publish GitHub release
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.mode != 'dry' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.plan.outputs.tag }}
+          generate_release_notes: true
+          prerelease: ${{ steps.plan.outputs.prerelease == 'true' }}
+          body: |
+            SHA-256 (`UsbTether-${{ steps.plan.outputs.version }}.zip`): `${{ steps.package.outputs.sha256 }}`
+          files: ${{ steps.package.outputs.archive }}
+          fail_on_unmatched_files: true
+
+      - name: Update cask
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.tap == 'true' }}
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
+        run: scripts/update-cask.py homebrew-tap/Casks/usbtether.rb "$VERSION" "$SHA256"
+
+      - name: Commit and push cask update
+        if: ${{ steps.plan.outputs.release == 'true' && steps.plan.outputs.tap == 'true' }}
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/usbtether.rb
+          git diff --staged --quiet || git commit -m "usbtether v$VERSION"
+          for _ in 1 2 3; do
+            git push && exit 0
+            git pull --rebase
+          done
+          echo "Failed to push cask update after 3 attempts" >&2
+          exit 1
