@@ -66,6 +66,7 @@ jobs:
         run: |
           scripts/test-next-version.sh
           scripts/test-update-cask.sh
+          scripts/test-release-plan.sh
 
       - name: Packaging tests
         run: scripts/test-packaging.sh

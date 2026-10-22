@@ -63,6 +63,7 @@ jobs:
       # The only token here is the read-only GITHUB_TOKEN, scoped to this step
       # (no dependency code has run yet); it is used for a best-effort
       # "already released" check so a tagged HEAD is not rebuilt every 6 hours.
+      # If the tap is not readable with it, the check is unknown and we build.
       - name: Plan release
         id: plan
         env:
@@ -72,93 +73,7 @@ jobs:
           OWNER: ${{ github.repository_owner }}
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: |
-          out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
-          skip() { echo "$1"; out release false; exit 0; }
-          stable_re='^v[0-9]+\.[0-9]+\.[0-9]+$'
-          tag_re='^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'
-
-          head_sha="$(git rev-parse HEAD)"
-          out commit "$head_sha"
-          dry=false
-          # new: the tag does not exist yet. resume: it exists already (a tag push,
-          # or HEAD is already tagged), so publish only creates or completes the release.
-          mode=new
-
-          case "$EVENT" in
-            push)
-              if [[ ! "$REF_NAME" =~ $tag_re ]]; then
-                echo "Tag $REF_NAME is not vMAJOR.MINOR.PATCH[-suffix]" >&2
-                exit 1
-              fi
-              mode=resume
-              tag="$REF_NAME"
-              version="${REF_NAME#v}"
-              ;;
-            workflow_run | schedule)
-              head_tags="$(git tag --points-at HEAD)"
-              stable_head="$(grep -E "$stable_re" <<<"$head_tags" | sort -V | tail -n 1 || true)"
-              if [ -n "$stable_head" ]; then
-                mode=resume
-                tag="$stable_head"
-                version="${tag#v}"
-              else
-                latest=""
-                while IFS= read -r t; do
-                  if [[ "$t" =~ $stable_re ]]; then latest="$t"; break; fi
-                done < <(git tag --list 'v[0-9]*' --sort=-v:refname)
-                if [ -z "$latest" ]; then
-                  skip "No stable tag yet (the first release is a manual v0.1.0 tag push), skipping."
-                fi
-                rc=0
-                git diff --quiet "$latest" "$head_sha" -- Cargo.lock app/Package.resolved || rc=$?
-                case "$rc" in
-                  0) skip "No dependency change since $latest, skipping." ;;
-                  1) ;;
-                  *) echo "git diff failed" >&2; exit 1 ;;
-                esac
-                version="$(scripts/next-version.sh)"
-                tag="v$version"
-              fi
-              ;;
-            workflow_dispatch)
-              if [ "$DRY_RUN" != "true" ]; then
-                echo "workflow_dispatch only supports dry runs; push a v* tag to release." >&2
-                exit 1
-              fi
-              dry=true
-              version=0.0.0-dryrun
-              tag="v$version"
-              ;;
-            *)
-              echo "Unexpected event $EVENT" >&2
-              exit 1
-              ;;
-          esac
-
-          # Best-effort: nothing to do if the release has its asset and the cask is current.
-          if [ "$mode" = resume ]; then
-            zip="UsbTether-$version.zip"
-            if assets="$(gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null)" \
-              && grep -Fxq "$zip" <<<"$assets"; then
-              if [[ "$version" == *-* ]]; then
-                skip "$tag is already released (prerelease, tap untouched), skipping."
-              fi
-              if content="$(gh api "repos/$OWNER/homebrew-tap/contents/Casks/usbtether.rb" --jq .content 2>/dev/null)" \
-                && cask="$(base64 --decode <<<"$content" 2>/dev/null)" \
-                && current="$(grep -m1 -E '^[[:space:]]*version "' <<<"$cask" | cut -d'"' -f2)" \
-                && [ "$current" = "$version" ]; then
-                skip "$tag is already released and the cask is at $version, skipping."
-              fi
-            fi
-          fi
-
-          echo "Release $tag (mode=$mode, dry=$dry)"
-          out release true
-          out mode "$mode"
-          out version "$version"
-          out tag "$tag"
-          out dry "$dry"
+        run: scripts/release-plan.sh
 
       - name: Test daemon
         if: ${{ steps.plan.outputs.release == 'true' }}
@@ -203,6 +118,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release
+          overwrite: true
           path: |
             ${{ steps.package.outputs.archive }}
             build/release-info.txt
@@ -223,8 +139,36 @@ jobs:
     env:
       VERSION: ${{ needs.build.outputs.version }}
       MODE: ${{ needs.build.outputs.mode }}
+      COMMIT: ${{ needs.build.outputs.commit }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # The build job ran dependency code: its outputs are untrusted input.
+      - name: Validate build outputs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "Invalid version $VERSION" >&2; exit 1
+          fi
+          if [ "$MODE" != new ] && [ "$MODE" != resume ]; then
+            echo "Invalid mode $MODE" >&2; exit 1
+          fi
+          if [[ ! "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Invalid commit $COMMIT" >&2; exit 1
+          fi
+          if [ "$EVENT" = push ]; then
+            # A tag push releases exactly the commit the tag points at.
+            tag_commit="$(gh api "repos/$GH_REPO/commits/v$VERSION" --jq .sha)"
+            [ "$tag_commit" = "$COMMIT" ] || { echo "Tag v$VERSION is at $tag_commit, not $COMMIT" >&2; exit 1; }
+          else
+            # Automatic releases only ever publish code that is on main.
+            status="$(gh api "repos/$GH_REPO/compare/main...$COMMIT" --jq .status)"
+            if [ "$status" != behind ] && [ "$status" != identical ]; then
+              echo "Commit $COMMIT is not reachable from main (compare status: $status)" >&2; exit 1
+            fi
+          fi
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.build.outputs.commit }}
@@ -236,17 +180,10 @@ jobs:
           name: release
           path: dist
 
-      # The build job ran dependency code, so treat its files as untrusted input.
       - name: Verify artifact
         id: info
         run: |
           out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
-            echo "Invalid version $VERSION" >&2; exit 1
-          fi
-          if [ "$MODE" != new ] && [ "$MODE" != resume ]; then
-            echo "Invalid mode $MODE" >&2; exit 1
-          fi
           zip="dist/UsbTether-$VERSION.zip"
           [ -f "$zip" ] || { echo "$zip is missing" >&2; exit 1; }
           get() { grep -m1 "^$1=" dist/release-info.txt | cut -d= -f2-; }
@@ -294,11 +231,15 @@ jobs:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           [ -f homebrew-tap/Casks/usbtether.rb ] || { echo "homebrew-tap/Casks/usbtether.rb not found" >&2; exit 1; }
-          header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TAP_TOKEN" | base64)"
+          encoded="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64)"
+          echo "::add-mask::$encoded"
+          header="AUTHORIZATION: basic $encoded"
           echo "::add-mask::$header"
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$header"
           git -C homebrew-tap push --dry-run origin HEAD
 
+      # Everything below decides from the live state (release, assets, cask), not
+      # from cached build outputs, so re-running only this job finishes a partial run.
       - name: Inspect existing release
         id: state
         env:
@@ -306,49 +247,82 @@ jobs:
           TAG: v${{ needs.build.outputs.version }}
           NAME: ${{ steps.info.outputs.name }}
           TAP: ${{ steps.info.outputs.tap }}
+          SHA256: ${{ steps.info.outputs.sha256 }}
         run: |
           out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; }
           release_exists=false
           asset_present=false
+          is_draft=false
+          # The hash users actually download wins over the one just built.
+          cask_sha="$SHA256"
           if assets="$(gh release view "$TAG" --json assets --jq '.assets[].name' 2>"$RUNNER_TEMP/gh-err")"; then
             release_exists=true
-            if grep -Fxq "$NAME" <<<"$assets"; then asset_present=true; fi
+            is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+            if grep -Fxq "$NAME" <<<"$assets"; then
+              asset_present=true
+              mkdir "$RUNNER_TEMP/existing"
+              gh release download "$TAG" --pattern "$NAME" --dir "$RUNNER_TEMP/existing"
+              cask_sha="$(shasum -a 256 "$RUNNER_TEMP/existing/$NAME" | cut -d' ' -f1)"
+            fi
           elif ! grep -qi 'not found' "$RUNNER_TEMP/gh-err"; then
             cat "$RUNNER_TEMP/gh-err" >&2
             exit 1
           fi
           cask_current=false
           if [ "$TAP" = true ]; then
-            current="$(grep -m1 -E '^[[:space:]]*version "' homebrew-tap/Casks/usbtether.rb | cut -d'"' -f2)"
-            if [ "$current" = "$VERSION" ]; then cask_current=true; fi
+            cask=homebrew-tap/Casks/usbtether.rb
+            current="$(grep -m1 -E '^  version "' "$cask" | cut -d'"' -f2)"
+            current_sha="$(grep -m1 -E '^  sha256 "' "$cask" | cut -d'"' -f2)"
+            if [ "$current" = "$VERSION" ] && [ "$current_sha" = "$cask_sha" ]; then cask_current=true; fi
           fi
           complete=false
-          if [ "$asset_present" = true ] && { [ "$TAP" != true ] || [ "$cask_current" = true ]; }; then
+          if [ "$release_exists" = true ] && [ "$is_draft" != true ] && [ "$asset_present" = true ] \
+            && { [ "$TAP" != true ] || [ "$cask_current" = true ]; }; then
             complete=true
             echo "$TAG is already released (release asset present, cask current), nothing to do."
           fi
-          echo "release_exists=$release_exists asset_present=$asset_present cask_current=$cask_current"
+          echo "release_exists=$release_exists draft=$is_draft asset_present=$asset_present cask_current=$cask_current"
           out release_exists "$release_exists"
+          out is_draft "$is_draft"
+          out asset_present "$asset_present"
           out cask_current "$cask_current"
+          out cask_sha "$cask_sha"
           out complete "$complete"
 
       # A tag pushed with GITHUB_TOKEN does not trigger another workflow run.
+      # The remote decides: an existing tag at the built commit is fine (re-run),
+      # one elsewhere is an error.
       - name: Create and push tag
-        if: ${{ env.MODE == 'new' && steps.state.outputs.complete != 'true' }}
+        if: ${{ steps.state.outputs.complete != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: v${{ needs.build.outputs.version }}
-          COMMIT: ${{ needs.build.outputs.commit }}
         run: |
+          encoded="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
+          echo "::add-mask::$encoded"
+          header="AUTHORIZATION: basic $encoded"
+          echo "::add-mask::$header"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$header"
+          remote="$(git ls-remote origin "refs/tags/$TAG" "refs/tags/$TAG^{}")"
+          if [ -n "$remote" ]; then
+            # An annotated tag lists the tag object and, peeled, its commit; prefer the peeled line.
+            remote_commit="$(awk '$2 ~ /\^\{\}$/ {print $1}' <<<"$remote")"
+            [ -n "$remote_commit" ] || remote_commit="$(awk '{print $1}' <<<"$remote" | head -n 1)"
+            if [ "$remote_commit" = "$COMMIT" ]; then
+              echo "Tag $TAG already points at $COMMIT, not pushing."
+              exit 0
+            fi
+            echo "Tag $TAG exists at $remote_commit, expected $COMMIT" >&2
+            exit 1
+          fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "Release $TAG" "$COMMIT"
-          header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64)"
-          echo "::add-mask::$header"
-          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$header"
           git push origin "refs/tags/$TAG"
 
-      - name: Create or update GitHub release
+      # Never overwrite a published asset (the cask must match what users download);
+      # release notes are left untouched.
+      - name: Create or complete GitHub release
         if: ${{ steps.state.outputs.complete != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -358,26 +332,36 @@ jobs:
           SHA256: ${{ steps.info.outputs.sha256 }}
           PRERELEASE: ${{ steps.info.outputs.prerelease }}
           RELEASE_EXISTS: ${{ steps.state.outputs.release_exists }}
+          ASSET_PRESENT: ${{ steps.state.outputs.asset_present }}
+          IS_DRAFT: ${{ steps.state.outputs.is_draft }}
         run: |
-          if [ "$RELEASE_EXISTS" = true ]; then
-            gh release upload "$TAG" "$ZIP" --clobber
-          else
+          if [ "$RELEASE_EXISTS" != true ]; then
             printf '%s\n' "SHA-256 (\`$NAME\`): \`$SHA256\`" > "$RUNNER_TEMP/notes.md"
             args=(--title "$TAG" --generate-notes --notes-file "$RUNNER_TEMP/notes.md" --verify-tag)
             if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
             gh release create "$TAG" "$ZIP" "${args[@]}"
+            exit 0
+          fi
+          if [ "$ASSET_PRESENT" != true ]; then
+            gh release upload "$TAG" "$ZIP"
+          fi
+          if [ "$IS_DRAFT" = true ]; then
+            gh release edit "$TAG" --draft=false
           fi
 
       - name: Update cask in tap
         if: ${{ steps.info.outputs.tap == 'true' && steps.state.outputs.cask_current != 'true' }}
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          SHA256: ${{ steps.info.outputs.sha256 }}
+          CASK_SHA: ${{ steps.state.outputs.cask_sha }}
         run: |
-          header="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$TAP_TOKEN" | base64)"
+          scripts/update-cask.py homebrew-tap/Casks/usbtether.rb "$VERSION" "$CASK_SHA"
+          # The auth header is only exported once the (token-free) updater has run.
+          encoded="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64)"
+          echo "::add-mask::$encoded"
+          header="AUTHORIZATION: basic $encoded"
           echo "::add-mask::$header"
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$header"
-          scripts/update-cask.py homebrew-tap/Casks/usbtether.rb "$VERSION" "$SHA256"
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

@@ -47,7 +47,6 @@ git -C "$REPO" init -q
 cd "$REPO"
 echo 1 > Cargo.lock; echo a > app/Package.resolved; echo x > README
 gg add -A; gg commit -qm base; gg tag v1.0.0
-BASE="$(git rev-parse HEAD)"
 echo y > README; gg commit -qam docs; DOCS="$(git rev-parse HEAD)"
 echo 2 > Cargo.lock; gg commit -qam "dep A"; A="$(git rev-parse HEAD)"
 echo 3 > Cargo.lock; gg commit -qam "dep B"; B="$(git rev-parse HEAD)"
