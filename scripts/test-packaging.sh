@@ -78,6 +78,26 @@ SL="$TMP/sl"; cp -R "$FAKE" "$SL"; rm "$SL/usbtetherd"; ln -s "$FAKE/usbtetherd"
 # shellcheck disable=SC2016
 check "symlinked source refused" bash -c '! USBTETHER_ROOT="$1" "$2/install-daemon.sh"' _ "$ROOT3" "$SL"
 check "nothing installed from symlinked source" test ! -e "$ROOT3/Library/PrivilegedHelperTools/usbtetherd"
+
+# verify_daemon (sourced, not executed): a mismatching copy removes the daemon AND the plist.
+V="$TMP/verify"; mkdir -p "$V"
+echo good > "$V/src"; echo bad > "$V/daemon"; echo plist > "$V/plist"
+# shellcheck disable=SC2016
+check "verify_daemon mismatch fails" bash -c '! ( source "$1"; verify_daemon "$2/src" "$2/daemon" "$2/plist" )' _ "$FAKE/install-daemon.sh" "$V"
+check "mismatch removes daemon" test ! -e "$V/daemon"
+check "mismatch removes plist" test ! -e "$V/plist"
+echo good > "$V/daemon"; echo plist > "$V/plist"
+# shellcheck disable=SC2016
+check "verify_daemon match succeeds" bash -c '( source "$1"; verify_daemon "$2/src" "$2/daemon" "$2/plist" )' _ "$FAKE/install-daemon.sh" "$V"
+check "match keeps plist" test -f "$V/plist"
+
+# Failing daemon install (read-only PrivilegedHelperTools) must leave no plist behind.
+ROOT4="$TMP/root4"; mkdir -p "$ROOT4/Library/PrivilegedHelperTools"
+chmod 555 "$ROOT4/Library/PrivilegedHelperTools"
+# shellcheck disable=SC2016
+check "install fails with read-only helper dir" bash -c '! USBTETHER_ROOT="$1" "$2/install-daemon.sh"' _ "$ROOT4" "$FAKE"
+check "no plist after failed daemon install" test ! -e "$ROOT4/Library/LaunchDaemons/com.philipp.usbtether.plist"
+chmod 755 "$ROOT4/Library/PrivilegedHelperTools"
 unset USBTETHER_ROOT USBTETHER_SKIP_LAUNCHCTL
 
 if [ "$(id -u)" -ne 0 ]; then
