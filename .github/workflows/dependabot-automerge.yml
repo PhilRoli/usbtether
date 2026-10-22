@@ -1,4 +1,7 @@
 # Branch protection must require the `ci` check so auto-merge waits for CI.
+# The repo setting "Allow auto-merge" must be enabled, or `gh pr merge --auto` fails.
+# Cargo 0.x minor bumps are reported as semver-minor by GitHub's metadata, so
+# they are auto-merged too; CI is their only safeguard.
 name: Dependabot auto-merge
 
 on: pull_request
@@ -9,7 +12,10 @@ permissions:
 
 jobs:
   auto-merge:
-    if: github.actor == 'dependabot[bot]'
+    if: >-
+      github.actor == 'dependabot[bot]'
+      && github.event.pull_request.user.login == 'dependabot[bot]'
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - id: meta

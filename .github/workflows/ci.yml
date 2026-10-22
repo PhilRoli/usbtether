@@ -22,6 +22,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Cache cargo
         uses: actions/cache@v6
@@ -63,7 +65,10 @@ jobs:
       - name: Packaging tests
         run: scripts/test-packaging.sh
 
+      # Separate target dir keeps the universal build out of the cached `target`.
       - name: Universal packaging smoke test
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-universal
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
           UNIVERSAL=1 scripts/package.sh 0.0.0-ci
