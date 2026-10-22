@@ -5,7 +5,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO" || exit 1
 
 FAILS=0
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d)" || exit 1
 trap 'rm -rf "$TMP"' EXIT
 
 pass() { echo "PASS: $1"; }
@@ -14,6 +14,8 @@ check() { # check <desc> <command...>
     local desc="$1"; shift
     if "$@" >/dev/null 2>&1; then pass "$desc"; else fail "$desc"; fi
 }
+# %Lp drops the sticky bit, so mode_full_is compares the 4-digit mode (e.g. 1755).
+mode_full_is() { [ "$(stat -f '%Mp%Lp' "$1" 2>/dev/null)" = "$2" ]; }
 mode_is() { [ "$(stat -f '%Lp' "$1" 2>/dev/null)" = "$2" ]; }
 
 # Stand-in daemon so install/uninstall tests do not need a build.
@@ -36,19 +38,52 @@ check "daemon mode 755" mode_is "$DAEMON" 755
 check "plist installed" test -f "$PLIST"
 check "plist mode 644" mode_is "$PLIST" 644
 check "Application Support dir exists" test -d "$APPSUP"
+check "installed daemon identical to source" cmp -s "$FAKE/usbtetherd" "$DAEMON"
+check "Application Support dir mode 755" mode_is "$APPSUP" 755
+check "log created" test -f "$ROOT/var/log/usbtether.log"
+check "log mode 640" mode_is "$ROOT/var/log/usbtether.log" 640
 check "install run 2 (idempotent) exits 0" "$FAKE/install-daemon.sh"
 check "daemon still present after rerun" test -f "$DAEMON"
 
-touch "$APPSUP/allowed.json" "$ROOT/var-run-marker"
+touch "$APPSUP/allowed.json"
 mkdir -p "$ROOT/var/run"
-touch "$ROOT/var/run/usbtether.sock"
+touch "$ROOT/var/run/usbtether.sock" "$ROOT/var/run/usbtetherd.pid"
 check "uninstall run 1 exits 0" "$FAKE/uninstall-daemon.sh"
 check "daemon removed" test ! -e "$DAEMON"
 check "plist removed" test ! -e "$PLIST"
+check "pidfile removed" test ! -e "$ROOT/var/run/usbtetherd.pid"
+check "log survives uninstall" test -f "$ROOT/var/log/usbtether.log"
 check "socket removed" test ! -e "$ROOT/var/run/usbtether.sock"
 check "uninstall run 2 exits 0" "$FAKE/uninstall-daemon.sh"
 check "Application Support left alone" test -f "$APPSUP/allowed.json"
+
+# Existing system dirs must never be altered (stock PrivilegedHelperTools is 1755).
+ROOT2="$TMP/root2"
+mkdir -p "$ROOT2/Library/PrivilegedHelperTools" "$ROOT2/Library/LaunchDaemons" "$ROOT2/var/log"
+chmod 1755 "$ROOT2/Library/PrivilegedHelperTools"
+chmod 750 "$ROOT2/Library/LaunchDaemons" "$ROOT2/var/log"
+check "install into pre-existing dirs" env USBTETHER_ROOT="$ROOT2" "$FAKE/install-daemon.sh"
+check "PrivilegedHelperTools mode unchanged" mode_full_is "$ROOT2/Library/PrivilegedHelperTools" 1755
+check "LaunchDaemons mode unchanged" mode_is "$ROOT2/Library/LaunchDaemons" 750
+check "var/log mode unchanged" mode_is "$ROOT2/var/log" 750
+
+
+# Source hardening: group-writable and symlinked sources are refused.
+ROOT3="$TMP/root3"; mkdir -p "$ROOT3"
+GW="$TMP/gw"; cp -R "$FAKE" "$GW"; chmod 775 "$GW/usbtetherd"
+# shellcheck disable=SC2016
+check "group-writable source refused" bash -c '! USBTETHER_ROOT="$1" "$2/install-daemon.sh"' _ "$ROOT3" "$GW"
+check "nothing installed from group-writable source" test ! -e "$ROOT3/Library/PrivilegedHelperTools/usbtetherd"
+SL="$TMP/sl"; cp -R "$FAKE" "$SL"; rm "$SL/usbtetherd"; ln -s "$FAKE/usbtetherd" "$SL/usbtetherd"
+# shellcheck disable=SC2016
+check "symlinked source refused" bash -c '! USBTETHER_ROOT="$1" "$2/install-daemon.sh"' _ "$ROOT3" "$SL"
+check "nothing installed from symlinked source" test ! -e "$ROOT3/Library/PrivilegedHelperTools/usbtetherd"
 unset USBTETHER_ROOT USBTETHER_SKIP_LAUNCHCTL
+
+if [ "$(id -u)" -ne 0 ]; then
+    # shellcheck disable=SC2016
+    check "install refuses non-root without prefix" bash -c '! "$1/install-daemon.sh"' _ "$FAKE"
+fi
 
 check "plutil lint daemon plist" plutil -lint packaging/com.philipp.usbtether.plist
 check "plutil lint Info.plist" plutil -lint packaging/Info.plist

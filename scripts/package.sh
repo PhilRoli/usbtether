@@ -4,8 +4,13 @@
 set -euo pipefail
 
 VERSION="${1:?Usage: package.sh <version>}"
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+    echo "invalid version: $VERSION" >&2
+    exit 1
+fi
 BUILD_VERSION="${VERSION%%-*}"   # CFBundleVersion must be numeric, so drop any -suffix
 UNIVERSAL="${UNIVERSAL:-1}"
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
@@ -15,21 +20,33 @@ RES="$APP/Contents/Resources"
 export USBTETHER_VERSION="$VERSION"
 
 if [ "$UNIVERSAL" = "1" ]; then
-    rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    for t in aarch64-apple-darwin x86_64-apple-darwin; do
+        if command -v rustup >/dev/null 2>&1; then
+            rustup target list --installed | grep -qx "$t" || rustup target add "$t"
+        elif [ ! -d "$(rustc --print sysroot)/lib/rustlib/$t" ]; then
+            echo "rust target $t is missing and rustup is not available" >&2
+            exit 1
+        fi
+    done
     cargo build --release --target aarch64-apple-darwin
     cargo build --release --target x86_64-apple-darwin
     DAEMON_BIN="$REPO/build/usbtetherd.universal"
     mkdir -p "$REPO/build"
     lipo -create -output "$DAEMON_BIN" \
-        target/aarch64-apple-darwin/release/usbtetherd \
-        target/x86_64-apple-darwin/release/usbtetherd
+        "$TARGET_DIR"/aarch64-apple-darwin/release/usbtetherd \
+        "$TARGET_DIR"/x86_64-apple-darwin/release/usbtetherd
     (cd app && swift build -c release --arch arm64 --arch x86_64)
     APP_BIN="$(cd app && swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/UsbTether"
 else
     cargo build --release
-    DAEMON_BIN="$REPO/target/release/usbtetherd"
+    DAEMON_BIN="$TARGET_DIR/release/usbtetherd"
     (cd app && swift build -c release)
     APP_BIN="$(cd app && swift build -c release --show-bin-path)/UsbTether"
+fi
+
+if [ "$UNIVERSAL" = "1" ]; then
+    lipo "$DAEMON_BIN" -verify_arch arm64 x86_64
+    lipo "$APP_BIN" -verify_arch arm64 x86_64
 fi
 
 rm -rf "$APP" "$REPO/build/UsbTether-$VERSION.zip"

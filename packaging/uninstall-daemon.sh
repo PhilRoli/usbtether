@@ -6,7 +6,13 @@ set -euo pipefail
 PREFIX="${USBTETHER_ROOT:-}"
 LABEL="com.philipp.usbtether"
 
-if [ "$(id -u)" -ne 0 ] && [ -z "$PREFIX" ]; then
+if [ "$(id -u)" -eq 0 ]; then
+    # Test overrides must be inert under real root.
+    if [ -n "$PREFIX" ] || [ -n "${USBTETHER_SKIP_LAUNCHCTL+x}" ]; then
+        echo "USBTETHER_ROOT / USBTETHER_SKIP_LAUNCHCTL are test-only and refused when running as root" >&2
+        exit 1
+    fi
+elif [ -z "$PREFIX" ]; then
     echo "uninstall-daemon.sh must be run as root" >&2
     exit 1
 fi
