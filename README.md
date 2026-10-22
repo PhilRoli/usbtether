@@ -1,4 +1,4 @@
-# usbtether
+# <img src="packaging/icon.png" width="48" height="48" align="absmiddle" alt="UsbTether icon"> UsbTether
 
 A trimmed fork of [rtether](https://github.com/nkazbekov/rtether) (MIT OR Apache-2.0): a macOS userspace RNDIS USB-tethering daemon (`usbtetherd`). It also builds on the ideas of erg-tether. Unlike upstream it only connects phones on an approved-phone allowlist: an unknown phone is not touched until an admin approves it over a local control socket (`/var/run/usbtether.sock`), and an approval app is launched for the console user when one is waiting.
 
