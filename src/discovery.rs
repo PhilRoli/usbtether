@@ -51,14 +51,23 @@ fn sanitize(s: Option<&str>) -> Option<String> {
         .map(|c| if c.is_whitespace() { ' ' } else { c })
         .filter(|&c| {
             !(c.is_control()
-                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-                    | '\u{2066}'..='\u{2069}' | '\u{FEFF}'))
+                || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}'
+                    | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'))
         })
         .collect();
     let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
     let capped: String = collapsed.chars().take(MAX_NAME_PART).collect();
     let capped = capped.trim().to_owned();
     (!capped.is_empty()).then_some(capped)
+}
+
+/// The serial used for identity: exactly what the device reports, or None
+/// when it reports nothing printable (empty, blank or invisible-only), so such
+/// a phone gets the weak-ID note and cannot collide with a real serial.
+pub fn identity_serial(raw: Option<&str>) -> Option<String> {
+    sanitize(raw)?;
+    raw.map(str::to_owned)
 }
 
 pub fn display_name(
@@ -105,7 +114,7 @@ pub fn scan() -> Vec<Candidate> {
                 id: DeviceId {
                     vid,
                     pid,
-                    serial: info.serial_number().map(str::to_owned),
+                    serial: identity_serial(info.serial_number()),
                 },
                 name: display_name(vid, pid, info.manufacturer_string(), info.product_string()),
                 info,
@@ -220,6 +229,36 @@ mod tests {
             display_name(0x04e8, 0x6864, Some("SAMSUNG"), Some("SAMSUNG_Android")),
             "SAMSUNG SAMSUNG_Android"
         );
+    }
+
+    #[test]
+    fn sanitiser_strips_more_invisible_characters() {
+        for c in [
+            '\u{061C}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{00AD}',
+            '\u{180E}',
+        ] {
+            let s = format!("Gal{c}axy");
+            assert_eq!(
+                display_name(1, 2, Some(&s), None),
+                "Galaxy",
+                "U+{:04X}",
+                c as u32
+            );
+        }
+    }
+
+    #[test]
+    fn blank_serial_is_no_serial_and_real_serial_stays_raw() {
+        assert_eq!(identity_serial(None), None);
+        assert_eq!(identity_serial(Some("")), None);
+        assert_eq!(identity_serial(Some("  \t\n ")), None);
+        assert_eq!(identity_serial(Some("\u{200B}\u{2060}")), None);
+        // Identity keeps the exact bytes the device reports.
+        assert_eq!(
+            identity_serial(Some(" R58\u{202E}N ")),
+            Some(" R58\u{202E}N ".to_owned())
+        );
+        assert_eq!(identity_serial(Some("R58N")), Some("R58N".to_owned()));
     }
 
     /// Manual check (Samsung plugged in):
