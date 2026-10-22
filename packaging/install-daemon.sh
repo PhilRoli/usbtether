@@ -19,7 +19,24 @@ verify_daemon() { # verify_daemon <source> <installed daemon> <installed plist>
 cleanup_on_failure() {
     if [ "$COMMITTED" != 1 ]; then
         rm -f "$HELPER_DIR/usbtetherd" "$PLIST_DEST"
+        echo "install failed; nothing installed; re-run $SELF as root" >&2
     fi
+}
+
+# Homebrew quarantines the cask download (whose checksum it has just verified) and install(1)
+# copies the flag, so Gatekeeper could refuse the unnotarized daemon and app. Strip it from the
+# verified root-owned daemon, and from the enclosing app only when this script runs from
+# <dir>/UsbTether.app/Contents/Resources. -s: never follow a symlink out of the bundle.
+strip_quarantine() { # strip_quarantine <installed daemon> <script dir>
+    /usr/bin/xattr -d com.apple.quarantine "$1" 2>/dev/null || true
+    case "$2" in
+        */UsbTether.app/Contents/Resources)
+            local app="${2%/Contents/Resources}"
+            if [ -d "$app" ] && [ ! -L "$app" ]; then
+                /usr/bin/xattr -drs com.apple.quarantine "$app" 2>/dev/null || true
+            fi
+            ;;
+    esac
 }
 
 main() {
@@ -90,6 +107,7 @@ main() {
     # shellcheck disable=SC2086
     install -m 755 $OWNER "$SRC/usbtetherd" "$HELPER_DIR/usbtetherd"
     verify_daemon "$SRC/usbtetherd" "$HELPER_DIR/usbtetherd" "$PLIST_DEST"
+    strip_quarantine "$HELPER_DIR/usbtetherd" "$SRC"
     # shellcheck disable=SC2086
     install -m 644 $OWNER "$SRC/$LABEL.plist" "$PLIST_DEST"
 

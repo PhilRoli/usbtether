@@ -17,6 +17,8 @@ check() { # check <desc> <command...>
 # %Lp drops the sticky bit, so mode_full_is compares the 4-digit mode (e.g. 1755).
 mode_full_is() { [ "$(stat -f '%Mp%Lp' "$1" 2>/dev/null)" = "$2" ]; }
 mode_is() { [ "$(stat -f '%Lp' "$1" 2>/dev/null)" = "$2" ]; }
+not_loose() { [ $(( 8#$(stat -f '%Lp' "$1") & 8#022 )) -eq 0 ]; } # not group/world-writable
+no_loose_files() { [ -z "$(find "$1" -perm +022)" ]; }
 
 # Stand-in daemon so install/uninstall tests do not need a build.
 FAKE="$TMP/fake-resources"
@@ -98,6 +100,37 @@ chmod 555 "$ROOT4/Library/PrivilegedHelperTools"
 check "install fails with read-only helper dir" bash -c '! USBTETHER_ROOT="$1" "$2/install-daemon.sh"' _ "$ROOT4" "$FAKE"
 check "no plist after failed daemon install" test ! -e "$ROOT4/Library/LaunchDaemons/com.philipp.usbtether.plist"
 chmod 755 "$ROOT4/Library/PrivilegedHelperTools"
+
+# Quarantine (Homebrew quarantines the download; install(1) copies the flag): the installed daemon
+# and, when the script runs from inside UsbTether.app, the app bundle lose it.
+has_quarantine() { xattr -p com.apple.quarantine "$1" >/dev/null 2>&1; }
+no_quarantine() { ! has_quarantine "$1"; }
+QAPP="$TMP/apps/UsbTether.app"; mkdir -p "$QAPP/Contents/MacOS"
+cp -R "$FAKE" "$QAPP/Contents/Resources"
+printf '#!/bin/sh\n' > "$QAPP/Contents/MacOS/UsbTether"
+QOUT="$TMP/outside"; echo keep > "$QOUT"; ln -s "$QOUT" "$QAPP/Contents/link-outside"
+for f in "$QAPP" "$QAPP/Contents/MacOS/UsbTether" "$QAPP/Contents/Resources/usbtetherd" "$QOUT"; do
+    xattr -w com.apple.quarantine "0081;00000000;Test;" "$f"
+done
+ROOT5="$TMP/root5"; mkdir -p "$ROOT5"
+check "install from quarantined app bundle exits 0" env USBTETHER_ROOT="$ROOT5" "$QAPP/Contents/Resources/install-daemon.sh"
+check "installed daemon has no quarantine flag" no_quarantine "$ROOT5/Library/PrivilegedHelperTools/usbtetherd"
+check "app bundle has no quarantine flag" no_quarantine "$QAPP"
+check "app executable has no quarantine flag" no_quarantine "$QAPP/Contents/MacOS/UsbTether"
+check "symlink target outside the bundle keeps its flag" has_quarantine "$QOUT"
+# Not inside UsbTether.app/Contents/Resources: the script's surroundings are left alone.
+QFAKE="$TMP/qfake"; cp -R "$FAKE" "$QFAKE"; xattr -w com.apple.quarantine "0081;00000000;Test;" "$QFAKE"
+xattr -w com.apple.quarantine "0081;00000000;Test;" "$QFAKE/usbtetherd"
+ROOT6="$TMP/root6"; mkdir -p "$ROOT6"
+check "install from other layout exits 0" env USBTETHER_ROOT="$ROOT6" "$QFAKE/install-daemon.sh"
+check "installed daemon from other layout has no quarantine flag" no_quarantine "$ROOT6/Library/PrivilegedHelperTools/usbtetherd"
+check "other layout's directory keeps its flag" has_quarantine "$QFAKE"
+
+# A failed install says so and how to retry.
+ROOT7="$TMP/root7"; mkdir -p "$ROOT7/Library/PrivilegedHelperTools"; chmod 555 "$ROOT7/Library/PrivilegedHelperTools"
+FAILMSG="$(USBTETHER_ROOT="$ROOT7" "$FAKE/install-daemon.sh" 2>&1 >/dev/null)"
+chmod 755 "$ROOT7/Library/PrivilegedHelperTools"
+check "failed install prints retry hint" grep -q "install failed; nothing installed; re-run $FAKE/install-daemon.sh as root" <<<"$FAILMSG"
 unset USBTETHER_ROOT USBTETHER_SKIP_LAUNCHCTL
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -124,6 +157,9 @@ for f in usbtetherd install-daemon.sh uninstall-daemon.sh; do
 done
 check "Resources/com.philipp.usbtether.plist" test -f "$APP/Contents/Resources/com.philipp.usbtether.plist"
 check "Resources/AppIcon.icns" test -f "$APP/Contents/Resources/AppIcon.icns"
+# install-daemon.sh refuses a group/world-writable bundle: catch a loose umask here, not at brew install.
+check "Resources dir not group/world-writable" not_loose "$APP/Contents/Resources"
+check "no group/world-writable file in Resources" no_loose_files "$APP/Contents/Resources"
 check "codesign verify" codesign --verify --deep --strict "$APP"
 check "LSUIElement is true" test "$(/usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$APP/Contents/Info.plist" 2>/dev/null)" = true
 check "CFBundleShortVersionString is 0.0.0-test" test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null)" = 0.0.0-test
