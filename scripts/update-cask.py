@@ -17,7 +17,12 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def stanza(name: str) -> re.Pattern:
-    return re.compile(rf'^([ \t]*){name} "[^"\n]*"[ \t]*(?=\r?$)', re.M)
+    # Exactly the cask's top-level indentation (two spaces), so deeper-indented
+    # lines such as heredoc text are never rewritten. Remaining limit: a heredoc
+    # line that is exactly `  version "..."` (two spaces) would still match; the
+    # one-match requirement turns such a cask into a hard failure, not a rewrite
+    # of the wrong line.
+    return re.compile(rf'^(  ){name} "[^"\n]*"[ \t]*(?=\r?$)', re.M)
 
 
 def main() -> None:

@@ -71,6 +71,11 @@ grep -v '^  version "' "$SRC" | sed 's/^      the first time/      the version "
 grep -q 'version "x"' "$TMP/caveat.rb" || fail "fixture setup: caveat text not injected"
 expect_reject "version only inside caveats text" "$TMP/caveat.rb" 1.2.3 "$SHA"
 
+# An indented line inside the caveats heredoc is never the version stanza.
+grep -v '^  version "' "$SRC" | sed 's/^      The first time.*/      version "9.9.9"/' > "$TMP/heredoc.rb"
+grep -q '^      version "9.9.9"' "$TMP/heredoc.rb" || fail "fixture setup: heredoc line not injected"
+expect_reject "indented version line inside caveats" "$TMP/heredoc.rb" 1.2.3 "$SHA"
+
 # CRLF line endings are preserved byte for byte outside the two lines.
 sed 's/$/\r/' "$SRC" > "$TMP/crlf.rb"
 if python3 -I "$SCRIPT" "$TMP/crlf.rb" 1.2.3 "$SHA" >/dev/null \
