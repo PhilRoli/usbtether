@@ -9,6 +9,7 @@
 //!        sudo usbtetherd --test  bring the link up but route only bound sockets over it
 
 mod devices;
+mod discovery;
 mod packet;
 mod rndis;
 mod session;
