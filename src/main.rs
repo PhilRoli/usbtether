@@ -8,6 +8,7 @@
 //! Usage: sudo usbtetherd         run in the foreground (Ctrl+C to stop)
 //!        sudo usbtetherd --test  bring the link up but route only bound sockets over it
 
+mod control;
 mod devices;
 mod discovery;
 mod gate;
