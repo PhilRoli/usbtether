@@ -256,7 +256,9 @@ fn serve_conn<S: Read + Write + ReadTimeout>(
     s.write_all(b"\n")
 }
 
-pub fn serve(ctx: Arc<Mutex<Ctx>>) -> io::Result<()> {
+/// Bind the socket and serve it on a new thread. The caller keeps the handle
+/// to notice if that thread ever ends (it never should).
+pub fn serve(ctx: Arc<Mutex<Ctx>>) -> io::Result<std::thread::JoinHandle<()>> {
     let _ = std::fs::remove_file(SOCKET);
     let listener = UnixListener::bind(SOCKET)?;
     // Anyone may connect; the per-connection peer check decides who gets an answer.
@@ -264,6 +266,7 @@ pub fn serve(ctx: Arc<Mutex<Ctx>>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("usbtether-control".into())
         .spawn(move || {
+            let _guard = crate::WorkerGuard("control socket");
             loop {
                 let mut s = match listener.accept() {
                     Ok((s, _)) => s,
@@ -283,10 +286,15 @@ pub fn serve(ctx: Arc<Mutex<Ctx>>) -> io::Result<()> {
                     continue;
                 }
                 let allowed = stream_peer_allowed(&s);
-                let _ = serve_conn(&mut s, allowed, &ctx);
+                // A bug triggered by one request must not end the thread.
+                let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    serve_conn(&mut s, allowed, &ctx)
+                }));
+                if served.is_err() {
+                    crate::log!("control socket: request handler panicked");
+                }
             }
-        })?;
-    Ok(())
+        })
 }
 
 #[cfg(test)]
