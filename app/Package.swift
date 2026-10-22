@@ -9,6 +9,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "UsbTetherCore"),
+        .executableTarget(name: "UsbTether", dependencies: ["UsbTetherCore"]),
         .testTarget(name: "UsbTetherCoreTests", dependencies: ["UsbTetherCore"])
     ]
 )

@@ -94,6 +94,16 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.problem)
     }
 
+    func testModelShowsApprovalWhenPendingAppears() async {
+        let client = FakeClient(.success(status()))
+        let model = AppModel(client: client)
+        await model.refresh()
+        XCTAssertNil(model.prompt)
+        client.nextStatus = .success(status(pending: [pending("a")]))
+        await model.refresh()
+        XCTAssertEqual(model.prompt?.name, "Pixel a")
+    }
+
     func testApproveClearsPrompt() async {
         let client = FakeClient(.success(status(pending: [pending("a")])))
         let model = AppModel(client: client)
