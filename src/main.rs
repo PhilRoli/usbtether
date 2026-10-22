@@ -10,6 +10,7 @@
 
 mod devices;
 mod discovery;
+mod gate;
 mod packet;
 mod rndis;
 mod session;
