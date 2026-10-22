@@ -62,6 +62,11 @@ jobs:
       - name: Install shellcheck
         run: command -v shellcheck >/dev/null || brew install shellcheck
 
+      - name: Release script tests
+        run: |
+          scripts/test-next-version.sh
+          scripts/test-update-cask.sh
+
       - name: Packaging tests
         run: scripts/test-packaging.sh
 
