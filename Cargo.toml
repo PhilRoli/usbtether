@@ -2,7 +2,7 @@
 name = "usbtetherd"
 version = "0.1.0"
 edition = "2024"
-description = "Trimmed, hardened macOS userspace RNDIS USB-tethering daemon with an approved-phone allowlist"
+description = "Trimmed macOS userspace RNDIS USB-tethering daemon that only connects phones on an approved-phone allowlist, with a local control socket for approvals"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 publish = false
