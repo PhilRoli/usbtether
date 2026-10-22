@@ -4,16 +4,18 @@ import UsbTetherCore
 
 @main
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let model = AppModel(client: SocketDaemonClient())
     private var window: NSWindow?
+    /// The phone last rendered in the approval prompt; never re-read at close time.
+    private var displayedPrompt: PendingPhone?
 
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
-        app.run()
+        withExtendedLifetime(delegate) { app.run() }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -30,18 +32,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await model.refresh() }
     }
 
-    /// Closing the window ends the app; the daemon launches it again when a phone is pending.
+    /// Closing the window quits. If a prompt is on screen the close counts as "Not now" for
+    /// that phone: it stays declined until the phone is replugged, and only then can it be
+    /// approved. The decline gets at most one second so a stuck daemon cannot block quitting.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        false
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        NSApp.terminate(nil)
+        return false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        switch closeAction(displayedPrompt: displayedPrompt) {
+        case .quit:
+            return .terminateNow
+        case .declineThenQuit(let phone):
+            var replied = false
+            let reply = {
+                guard !replied else { return }
+                replied = true
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+            Task {
+                await model.decline(phone)
+                reply()
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                reply()
+            }
+            return .terminateLater
+        }
     }
 
     private func showWindow() {
         if window == nil {
-            let hosting = NSHostingController(rootView: PreferencesView(model: model))
+            let hosting = NSHostingController(rootView: PreferencesView(
+                model: model,
+                onPromptShown: { [weak self] in self?.displayedPrompt = $0 }))
             let newWindow = NSWindow(contentViewController: hosting)
             newWindow.title = "UsbTether"
             newWindow.styleMask = [.titled, .closable, .miniaturizable]
             newWindow.isReleasedWhenClosed = false
+            newWindow.delegate = self
             newWindow.center()
             window = newWindow
         }

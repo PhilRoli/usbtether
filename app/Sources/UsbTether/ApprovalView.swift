@@ -22,9 +22,9 @@ struct ApprovalView: View {
             }
             HStack {
                 Button("Approve") { Task { await model.approve(phone) } }
-                    .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier("approveButton")
                 Button("Not now") { Task { await model.decline(phone) } }
+                    .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier("declineButton")
             }
         }

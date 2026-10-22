@@ -35,4 +35,18 @@ final class PresentationTests: XCTestCase {
         XCTAssertEqual(Presentation.serialText(nil), "no serial")
         XCTAssertEqual(Presentation.serialText("ABC"), "ABC")
     }
+
+    func testVidPidOutOfRangeDoesNotMisprint() {
+        XCTAssertEqual(Presentation.vidPid(vid: -1, pid: 0x10000), "????:????")
+        XCTAssertEqual(Presentation.vidPid(vid: Int.max, pid: 0xffff), "????:ffff")
+    }
+
+    func testCloseWithoutPromptQuitsImmediately() {
+        XCTAssertEqual(closeAction(displayedPrompt: nil), .quit)
+    }
+
+    func testCloseWithPromptDeclinesDisplayedPhoneThenQuits() {
+        let phone = pending("a")
+        XCTAssertEqual(closeAction(displayedPrompt: phone), .declineThenQuit(phone))
+    }
 }

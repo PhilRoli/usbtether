@@ -3,6 +3,8 @@ import UsbTetherCore
 
 struct PreferencesView: View {
     @ObservedObject var model: AppModel
+    /// Reports the phone currently shown in the approval prompt (nil if none).
+    var onPromptShown: (PendingPhone?) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -23,6 +25,8 @@ struct PreferencesView: View {
         }
         .padding(16)
         .frame(width: 420)
+        .onAppear { onPromptShown(model.prompt) }
+        .onChange(of: model.prompt) { onPromptShown($0) }
         .task {
             // Tied to the view's lifetime: cancelled when the window goes away.
             while !Task.isCancelled {
