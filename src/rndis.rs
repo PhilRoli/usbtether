@@ -312,7 +312,7 @@ mod tests {
             seed ^= seed << 17;
             let len = (seed % 200) as usize;
             let mut buf: Vec<u8> = (0..len).map(|i| (seed >> (i % 56)) as u8).collect();
-            if len >= 16 && seed % 3 == 0 {
+            if len >= 16 && seed.is_multiple_of(3) {
                 buf[0..4].copy_from_slice(&MSG_PACKET.to_le_bytes());
             }
             for_each_frame(&buf, |f| assert!(f.len() >= 14));
