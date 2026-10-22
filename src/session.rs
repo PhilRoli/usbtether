@@ -67,7 +67,10 @@ impl Drop for StopOnUnwind {
     }
 }
 
-pub fn run(info: DeviceInfo, quit: &AtomicBool, test: bool) -> io::Result<()> {
+/// `revoke` is set by the control socket when the running phone's approval is
+/// removed; it ends the session like an unplug. The caller resets it to false
+/// (under the Ctx lock) before starting the session.
+pub fn run(info: DeviceInfo, quit: &AtomicBool, revoke: &AtomicBool, test: bool) -> io::Result<()> {
     let ifaces: Vec<IfaceDesc> = info
         .interfaces()
         .map(|i| IfaceDesc {
@@ -156,7 +159,13 @@ pub fn run(info: DeviceInfo, quit: &AtomicBool, test: bool) -> io::Result<()> {
         lease.lease_secs
     );
 
-    if sysnet::lease_collides(&lease, &sysnet::local_ipv4_addrs()) {
+    // Fail closed: if we cannot list local addresses, we cannot vet the lease.
+    let local = sysnet::local_ipv4_addrs()
+        .map_err(|e| io::Error::other(format!("cannot list local addresses: {e}")))?;
+    if revoke.load(Relaxed) {
+        return Err(io::Error::other("approval revoked"));
+    }
+    if sysnet::lease_collides(&lease, &local) {
         return Err(io::Error::other(format!(
             "phone's lease ({} via {}) collides with an address already on this Mac; refusing it",
             lease.ip, lease.router
@@ -215,6 +224,7 @@ pub fn run(info: DeviceInfo, quit: &AtomicBool, test: bool) -> io::Result<()> {
     let mut renew_at = started + half_lease(lease.lease_secs);
     let mut acks_seen = 0;
     while !quit.load(Relaxed)
+        && !revoke.load(Relaxed)
         && !shared.dead.load(Relaxed)
         && !rx.is_finished()
         && !tx.is_finished()
@@ -234,6 +244,9 @@ pub fn run(info: DeviceInfo, quit: &AtomicBool, test: bool) -> io::Result<()> {
         }
     }
 
+    if revoke.load(Relaxed) {
+        log!("approval removed; ending the session");
+    }
     shared.stop.store(true, Relaxed);
     let _ = rx.join();
     let _ = tx.join();

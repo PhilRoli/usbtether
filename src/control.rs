@@ -6,6 +6,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,10 @@ pub struct Ctx {
     pub gate: Gate,
     pub store: Store,
     pub phone: Option<PhoneInfo>,
+    /// Device whose session is running right now (set/cleared by main).
+    pub active: Option<DeviceId>,
+    /// Set when the active device's approval is removed; the session ends.
+    pub revoke: Arc<AtomicBool>,
 }
 
 #[derive(Deserialize)]
@@ -109,37 +114,71 @@ pub fn handle(line: &str, ctx: &mut Ctx) -> String {
         }
         Request::Remove { vid, pid, serial } => {
             let id = DeviceId { vid, pid, serial };
-            if let Err(e) = ctx.store.remove(&id) {
-                return error_reply(&format!("store write failed: {e}"));
+            match ctx.store.remove(&id) {
+                Err(e) => return error_reply(&format!("store write failed: {e}")),
+                Ok(true) if ctx.active.as_ref() == Some(&id) => {
+                    // Revoke the running session and do not re-prompt for the
+                    // still-plugged-in phone until it is replugged.
+                    ctx.gate.suppress(&id);
+                    ctx.revoke.store(true, Ordering::SeqCst);
+                }
+                Ok(_) => {}
             }
         }
     }
     status_reply(ctx)
 }
 
-/// Fails with `TimedOut` once `limit` has elapsed since creation, checked
-/// before every read (per-read socket timeouts alone let a slow drip last forever).
+/// Streams whose read timeout can be adjusted (sockets); a no-op elsewhere.
+pub trait ReadTimeout {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()>;
+}
+
+impl ReadTimeout for UnixStream {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        UnixStream::set_read_timeout(self, d)
+    }
+}
+
+impl<T: ReadTimeout + ?Sized> ReadTimeout for &mut T {
+    fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> {
+        (**self).set_read_timeout(d)
+    }
+}
+
+impl ReadTimeout for &[u8] {
+    fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Fails with `TimedOut` once `limit` has elapsed since creation. Before every
+/// read the socket timeout is set to the time left (floor 1 ms), so the total
+/// is bounded exactly rather than per read.
 struct Deadline<R> {
     inner: R,
     start: Instant,
     limit: Duration,
 }
 
-impl<R: Read> Read for Deadline<R> {
+impl<R: Read + ReadTimeout> Read for Deadline<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.start.elapsed() >= self.limit {
+        let left = self.limit.saturating_sub(self.start.elapsed());
+        if left.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "request took too long",
             ));
         }
+        self.inner
+            .set_read_timeout(Some(left.max(Duration::from_millis(1))))?;
         self.inner.read(buf)
     }
 }
 
 /// Read one request line, refusing anything over `MAX_REQUEST` bytes or
 /// taking longer than `limit` in total.
-pub fn read_request(r: impl Read, limit: Duration) -> io::Result<String> {
+pub fn read_request(r: impl Read + ReadTimeout, limit: Duration) -> io::Result<String> {
     let r = Deadline {
         inner: r,
         start: Instant::now(),
@@ -196,7 +235,11 @@ fn current_phone() -> Option<PhoneInfo> {
 
 /// Serve one connection. `allowed` is the peer verdict, decided before any
 /// byte of the request is read. The `Ctx` lock is held only inside `handle`.
-fn serve_conn<S: Read + Write>(s: &mut S, allowed: bool, ctx: &Mutex<Ctx>) -> io::Result<()> {
+fn serve_conn<S: Read + Write + ReadTimeout>(
+    s: &mut S,
+    allowed: bool,
+    ctx: &Mutex<Ctx>,
+) -> io::Result<()> {
     if !allowed {
         return s.write_all(b"{\"error\":\"not allowed\"}\n");
     }
@@ -232,9 +275,11 @@ pub fn serve(ctx: Arc<Mutex<Ctx>>) -> io::Result<()> {
                 };
                 // Bounded in time and size: a stuck or hostile client must not
                 // wedge the control thread.
-                if s.set_read_timeout(Some(REQUEST_DEADLINE)).is_err()
-                    || s.set_write_timeout(Some(REQUEST_DEADLINE)).is_err()
+                if let Err(e) = s
+                    .set_read_timeout(Some(REQUEST_DEADLINE))
+                    .and_then(|()| s.set_write_timeout(Some(REQUEST_DEADLINE)))
                 {
+                    crate::log!("control socket: could not set timeouts: {e}");
                     continue;
                 }
                 let allowed = stream_peer_allowed(&s);
@@ -266,6 +311,8 @@ mod tests {
             gate: Gate::new(),
             store: Store::load(&d.join("devices.json"), unsafe { libc::geteuid() }),
             phone: None,
+            active: None,
+            revoke: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -369,6 +416,50 @@ mod tests {
         assert!(!c.store.is_approved(&id(1)));
     }
 
+    fn add_approved(c: &mut Ctx, pid: u16) {
+        c.store
+            .add(ApprovedDevice {
+                id: id(pid),
+                name: "Pixel".into(),
+                approved_at: 1,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn remove_of_active_device_revokes_and_suppresses_reprompt() {
+        let mut c = ctx();
+        add_approved(&mut c, 1);
+        c.active = Some(id(1));
+        let line = r#"{"cmd":"remove","vid":1256,"pid":1,"serial":"S1"}"#;
+        handle(line, &mut c);
+        assert!(c.revoke.load(Ordering::SeqCst));
+        assert!(!c.store.is_approved(&id(1)));
+        assert_eq!(c.gate.evaluate(&id(1), "Pixel", &c.store), Decision::Wait);
+        assert!(c.gate.pending().is_empty());
+    }
+
+    #[test]
+    fn remove_of_non_active_device_does_not_revoke() {
+        let mut c = ctx();
+        add_approved(&mut c, 1);
+        add_approved(&mut c, 2);
+        c.active = Some(id(2));
+        handle(
+            r#"{"cmd":"remove","vid":1256,"pid":1,"serial":"S1"}"#,
+            &mut c,
+        );
+        assert!(!c.store.is_approved(&id(1)));
+        assert!(!c.revoke.load(Ordering::SeqCst));
+        // removing a device that was never approved doesn't revoke either
+        c.active = Some(id(3));
+        handle(
+            r#"{"cmd":"remove","vid":1256,"pid":3,"serial":"S3"}"#,
+            &mut c,
+        );
+        assert!(!c.revoke.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn approve_with_unknown_request_id_errors_and_keeps_state() {
         let mut c = ctx();
@@ -457,6 +548,11 @@ mod tests {
     #[test]
     fn slow_drip_request_hits_total_deadline() {
         struct Drip;
+        impl ReadTimeout for Drip {
+            fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
+            }
+        }
         impl Read for Drip {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
                 std::thread::sleep(Duration::from_millis(30));
@@ -505,6 +601,11 @@ mod tests {
             fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
                 self.read = true;
                 Ok(0)
+            }
+        }
+        impl ReadTimeout for Spy {
+            fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+                Ok(())
             }
         }
         impl Write for Spy {

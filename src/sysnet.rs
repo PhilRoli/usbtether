@@ -160,11 +160,11 @@ impl Drop for NetConfig {
 }
 
 /// Every IPv4 address currently configured on any local interface.
-pub fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
+pub fn local_ipv4_addrs() -> io::Result<Vec<Ipv4Addr>> {
     let mut out = Vec::new();
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return out;
+        return Err(io::Error::last_os_error());
     }
     let mut cur = list;
     while !cur.is_null() {
@@ -177,7 +177,7 @@ pub fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
         cur = ifa.ifa_next;
     }
     unsafe { libc::freeifaddrs(list) };
-    out
+    Ok(out)
 }
 
 /// True if the phone's lease would hand us, or point us at, an address this
@@ -224,6 +224,15 @@ mod tests {
             &lease([192, 168, 1, 77], [192, 168, 1, 1]),
             &local
         ));
+    }
+
+    #[test]
+    fn local_addrs_include_loopback() {
+        assert!(
+            local_ipv4_addrs()
+                .unwrap()
+                .contains(&Ipv4Addr::new(127, 0, 0, 1))
+        );
     }
 
     #[test]

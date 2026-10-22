@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use control::Ctx;
 use devices::{DeviceId, STORE_PATH, Store};
+use discovery::Candidate;
 use gate::{Decision, Gate};
 
 const CONSOLE_POLL: Duration = Duration::from_secs(2);
@@ -104,14 +105,98 @@ fn running_pid() -> Option<i32> {
     is_usbtetherd.then_some(pid)
 }
 
+/// Index of the device to connect: the first `Connect` that is not the device
+/// already being served.
+fn pick_connect(decisions: &[(DeviceId, Decision)], active: Option<&DeviceId>) -> Option<usize> {
+    decisions
+        .iter()
+        .position(|(id, d)| *d == Decision::Connect && Some(id) != active)
+}
+
+fn sleep_unless_quit(total: Duration) {
+    let step = Duration::from_millis(100);
+    let mut left = total;
+    while !left.is_zero() && !QUIT.load(Relaxed) {
+        let d = step.min(left);
+        thread::sleep(d);
+        left -= d;
+    }
+}
+
+/// Scan, gate, prompt and launch the approval app, once a second, for the
+/// whole life of the daemon (sessions run on the main thread meanwhile).
+/// The Ctx lock is held only for the gate decisions, never across a scan,
+/// a launch or a session.
+fn supervise(ctx: &Mutex<Ctx>, slot: &Mutex<Option<Candidate>>, busy: &AtomicBool) {
+    let mut console_prev: Option<u32> = None;
+    let mut console_polled: Option<Instant> = None;
+    let mut newly_prompted = false;
+    while !QUIT.load(Relaxed) {
+        let candidates = discovery::scan();
+        let present: Vec<DeviceId> = candidates.iter().map(|c| c.id.clone()).collect();
+        let (decisions, active, pending_nonempty) = {
+            let mut c = ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let active = c.active.clone();
+            let Ctx { gate, store, .. } = &mut *c;
+            gate.device_gone(&present);
+            let decisions: Vec<(DeviceId, Decision)> = candidates
+                .iter()
+                .map(|cand| (cand.id.clone(), gate.evaluate(&cand.id, &cand.name, store)))
+                .collect();
+            (decisions, active, !gate.pending().is_empty())
+        };
+
+        for (cand, (_, decision)) in candidates.iter().zip(&decisions) {
+            if matches!(decision, Decision::Prompt(_)) {
+                log!(
+                    "unapproved device {} {:04x}:{:04x} waiting for approval",
+                    cand.name,
+                    cand.id.vid,
+                    cand.id.pid
+                );
+                newly_prompted = true;
+            }
+        }
+
+        if !busy.load(Relaxed)
+            && let Some(i) = pick_connect(&decisions, active.as_ref())
+        {
+            let mut s = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if s.is_none() {
+                *s = candidates.into_iter().nth(i);
+            }
+        }
+
+        if console_polled.is_none_or(|t| t.elapsed() >= CONSOLE_POLL) {
+            console_polled = Some(Instant::now());
+            let now = launcher::console_uid();
+            if launcher::should_launch(console_prev, now, newly_prompted, pending_nonempty)
+                && let Some(uid) = now
+                && let Err(e) = launcher::launch_app(uid)
+            {
+                log!("could not launch the approval app: {e}");
+            }
+            console_prev = now;
+            newly_prompted = false;
+        }
+
+        sleep_unless_quit(Duration::from_secs(1));
+    }
+}
+
 /// Run one phone session on this thread. A panic (bad input from a device)
 /// must not take the daemon down: unwinding drops the session's routes and
 /// DNS, and we go back to scanning.
-fn run_session(info: nusb::DeviceInfo, test: bool) {
+fn run_session(info: nusb::DeviceInfo, revoke: &AtomicBool, test: bool) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        session::run(info, &QUIT, test)
+        session::run(info, &QUIT, revoke, test)
     }))
     .unwrap_or_else(|_| Err(std::io::Error::other("session crashed")));
+    // A panicking session never reached its own cleanup of the status.
+    *state::global()
+        .phone
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
     match result {
         Ok(()) if !QUIT.load(Relaxed) => {
             log!("phone disconnected; waiting for it to come back")
@@ -159,83 +244,99 @@ fn main() {
     }
 
     log!("usbtetherd {VERSION} starting");
+    let revoke = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(Mutex::new(Ctx {
         gate: Gate::new(),
         store: Store::load(Path::new(STORE_PATH), 0),
         phone: None,
+        active: None,
+        revoke: revoke.clone(),
     }));
     if let Err(e) = control::serve(ctx.clone()) {
         log!("warning: control socket unavailable ({e}); new phones cannot be approved");
     }
     log!("waiting for an approved phone — plug it in and turn on USB tethering");
 
-    let mut console_prev: Option<u32> = None;
-    let mut console_polled: Option<Instant> = None;
-    let mut newly_prompted = false;
+    // The supervisor keeps scanning, prompting and launching the app while a
+    // session blocks this thread; it hands over at most one approved device.
+    let slot: Arc<Mutex<Option<Candidate>>> = Arc::new(Mutex::new(None));
+    let busy = Arc::new(AtomicBool::new(false));
+    let supervisor = {
+        let (ctx, slot, busy) = (ctx.clone(), slot.clone(), busy.clone());
+        thread::Builder::new()
+            .name("usbtether-supervisor".into())
+            .spawn(move || supervise(&ctx, &slot, &busy))
+            .expect("spawn supervisor")
+    };
+
     while !QUIT.load(Relaxed) {
-        let candidates = discovery::scan();
-        let present: Vec<DeviceId> = candidates.iter().map(|c| c.id.clone()).collect();
-        // The Ctx lock is held only for these decisions, never during a session.
-        let (decisions, pending_nonempty) = {
-            let mut c = ctx.lock().unwrap_or_else(|e| e.into_inner());
-            let Ctx { gate, store, .. } = &mut *c;
-            gate.device_gone(&present);
-            let decisions: Vec<Decision> = candidates
-                .iter()
-                .map(|cand| gate.evaluate(&cand.id, &cand.name, store))
-                .collect();
-            (decisions, !gate.pending().is_empty())
+        let taken = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(cand) = taken else {
+            thread::sleep(Duration::from_millis(200));
+            continue;
         };
-
-        let mut ran_session = false;
-        for (cand, decision) in candidates.into_iter().zip(decisions) {
-            match decision {
-                Decision::Wait => {}
-                Decision::Prompt(_) => {
-                    log!(
-                        "unapproved device {} {:04x}:{:04x} waiting for approval",
-                        cand.name,
-                        cand.id.vid,
-                        cand.id.pid
-                    );
-                    newly_prompted = true;
-                }
-                Decision::Connect => {
-                    // Defence in depth: re-check the allowlist right before touching the phone.
-                    let still_approved = ctx
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .store
-                        .is_approved(&cand.id);
-                    if !still_approved {
-                        continue;
-                    }
-                    ran_session = true;
-                    run_session(cand.info, test);
-                    break; // one phone at a time; rescan afterwards
-                }
+        busy.store(true, Relaxed);
+        {
+            // Defence in depth: re-check the allowlist right before touching
+            // the phone. Marking it active and resetting revoke happen under
+            // the same lock as the check, so a later Remove cannot be lost.
+            let mut c = ctx.lock().unwrap_or_else(|e| e.into_inner());
+            if !c.store.is_approved(&cand.id) {
+                busy.store(false, Relaxed);
+                continue;
             }
+            c.active = Some(cand.id.clone());
+            revoke.store(false, Relaxed);
         }
-
-        if console_polled.is_none_or(|t| t.elapsed() >= CONSOLE_POLL) {
-            console_polled = Some(Instant::now());
-            let now = launcher::console_uid();
-            if launcher::should_launch(console_prev, now, newly_prompted, pending_nonempty)
-                && let Some(uid) = now
-                && let Err(e) = launcher::launch_app(uid)
-            {
-                log!("could not launch the approval app: {e}");
-            }
-            console_prev = now;
-            newly_prompted = false;
-        }
-
-        if !ran_session {
-            thread::sleep(Duration::from_secs(1));
-        }
+        // The Ctx lock is not held while the session runs.
+        run_session(cand.info, &revoke, test);
+        ctx.lock().unwrap_or_else(|e| e.into_inner()).active = None;
+        busy.store(false, Relaxed);
     }
+    let _ = supervisor.join();
 
     sysnet::remove_dns();
     let _ = fs::remove_file(PIDFILE);
     log!("stopped; normal networking restored");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use devices::ApprovedDevice;
+
+    fn id(pid: u16) -> DeviceId {
+        DeviceId {
+            vid: 0x04e8,
+            pid,
+            serial: Some(format!("S{pid}")),
+        }
+    }
+
+    #[test]
+    fn approved_and_unapproved_both_present_connect_picks_approved_and_other_still_prompts() {
+        let dir = std::env::temp_dir().join(format!("usbtether-maintest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::load(&dir.join("devices.json"), unsafe { libc::geteuid() });
+        store
+            .add(ApprovedDevice {
+                id: id(1),
+                name: "A".into(),
+                approved_at: 1,
+            })
+            .unwrap();
+        let mut gate = Gate::new();
+        // unapproved one is listed first
+        let decisions = vec![
+            (id(2), gate.evaluate(&id(2), "B", &store)),
+            (id(1), gate.evaluate(&id(1), "A", &store)),
+        ];
+        assert!(matches!(decisions[0].1, Decision::Prompt(_)));
+        assert_eq!(pick_connect(&decisions, None), Some(1));
+        assert_eq!(gate.pending().len(), 1);
+        // the device already being served is not offered again
+        assert_eq!(pick_connect(&decisions, Some(&id(1))), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

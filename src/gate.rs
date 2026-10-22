@@ -110,6 +110,13 @@ impl Gate {
         Ok(())
     }
 
+    /// Stop prompting for a device that is still plugged in (e.g. its approval
+    /// was just removed) until it is replugged.
+    pub fn suppress(&mut self, id: &DeviceId) {
+        self.pending.retain(|p| p.id != *id);
+        self.declined.insert(id.clone());
+    }
+
     pub fn device_gone(&mut self, present: &[DeviceId]) {
         self.pending.retain(|p| present.contains(&p.id));
         self.declined.retain(|d| present.contains(d));
@@ -256,6 +263,22 @@ mod tests {
         assert!(!s.is_approved(&id(1)));
         assert_eq!(g.pending().len(), 1);
         assert_eq!(g.pending()[0].request_id, r);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn suppress_waits_until_replug() {
+        let s = store();
+        let mut g = Gate::new();
+        g.suppress(&id(1));
+        assert_eq!(g.evaluate(&id(1), "Pixel", &s), Decision::Wait);
+        g.device_gone(&[id(1)]);
+        assert_eq!(g.evaluate(&id(1), "Pixel", &s), Decision::Wait);
+        g.device_gone(&[]);
+        assert!(matches!(
+            g.evaluate(&id(1), "Pixel", &s),
+            Decision::Prompt(_)
+        ));
     }
 
     #[test]
