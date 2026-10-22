@@ -1,8 +1,5 @@
 //! Finds RNDIS tethering candidates from enumeration data alone.
 
-// consumed by later tasks (gate/main); remove once wired
-#![allow(dead_code)]
-
 use nusb::MaybeFuture;
 
 use crate::devices::DeviceId;

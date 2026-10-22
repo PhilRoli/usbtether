@@ -2,15 +2,12 @@
 //! Only root and members of the `admin` group get any answer; the check uses
 //! the peer's credentials (checked before reading), not file permissions.
 
-// consumed by main in a later task; remove once wired
-#![allow(dead_code)]
-
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -21,6 +18,7 @@ use crate::state::{self, PhoneInfo};
 pub const SOCKET: &str = "/var/run/usbtether.sock";
 const ADMIN_GID: libc::gid_t = 80;
 const MAX_REQUEST: u64 = 64 * 1024;
+const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
 
 pub struct Ctx {
     pub gate: Gate,
@@ -119,8 +117,34 @@ pub fn handle(line: &str, ctx: &mut Ctx) -> String {
     status_reply(ctx)
 }
 
-/// Read one request line, refusing anything over `MAX_REQUEST` bytes.
-pub fn read_request(r: impl Read) -> io::Result<String> {
+/// Fails with `TimedOut` once `limit` has elapsed since creation, checked
+/// before every read (per-read socket timeouts alone let a slow drip last forever).
+struct Deadline<R> {
+    inner: R,
+    start: Instant,
+    limit: Duration,
+}
+
+impl<R: Read> Read for Deadline<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.start.elapsed() >= self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request took too long",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
+/// Read one request line, refusing anything over `MAX_REQUEST` bytes or
+/// taking longer than `limit` in total.
+pub fn read_request(r: impl Read, limit: Duration) -> io::Result<String> {
+    let r = Deadline {
+        inner: r,
+        start: Instant::now(),
+        limit,
+    };
     let mut line = String::new();
     BufReader::new(r.take(MAX_REQUEST + 1)).read_line(&mut line)?;
     if line.len() as u64 > MAX_REQUEST {
@@ -176,7 +200,7 @@ fn serve_conn<S: Read + Write>(s: &mut S, allowed: bool, ctx: &Mutex<Ctx>) -> io
     if !allowed {
         return s.write_all(b"{\"error\":\"not allowed\"}\n");
     }
-    let reply = match read_request(&mut *s) {
+    let reply = match read_request(&mut *s, REQUEST_DEADLINE) {
         Ok(line) => {
             let phone = current_phone();
             let mut c = ctx.lock().unwrap_or_else(|e| e.into_inner());
@@ -197,11 +221,19 @@ pub fn serve(ctx: Arc<Mutex<Ctx>>) -> io::Result<()> {
     std::thread::Builder::new()
         .name("usbtether-control".into())
         .spawn(move || {
-            for mut s in listener.incoming().flatten() {
+            loop {
+                let mut s = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        crate::log!("control socket accept failed: {e}");
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                };
                 // Bounded in time and size: a stuck or hostile client must not
                 // wedge the control thread.
-                if s.set_read_timeout(Some(Duration::from_secs(2))).is_err()
-                    || s.set_write_timeout(Some(Duration::from_secs(2))).is_err()
+                if s.set_read_timeout(Some(REQUEST_DEADLINE)).is_err()
+                    || s.set_write_timeout(Some(REQUEST_DEADLINE)).is_err()
                 {
                     continue;
                 }
@@ -411,12 +443,49 @@ mod tests {
     #[test]
     fn read_request_accepts_line_and_rejects_65_kib() {
         let ok = b"{\"cmd\":\"status\"}\n";
-        assert_eq!(read_request(&ok[..]).unwrap(), "{\"cmd\":\"status\"}\n");
+        assert_eq!(
+            read_request(&ok[..], Duration::from_secs(2)).unwrap(),
+            "{\"cmd\":\"status\"}\n"
+        );
         let mut big = vec![b'a'; 65 * 1024];
         big.push(b'\n');
-        assert!(read_request(&big[..]).is_err());
+        assert!(read_request(&big[..], Duration::from_secs(2)).is_err());
         let big_no_nl = vec![b'a'; 65 * 1024];
-        assert!(read_request(&big_no_nl[..]).is_err());
+        assert!(read_request(&big_no_nl[..], Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn slow_drip_request_hits_total_deadline() {
+        struct Drip;
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(30));
+                buf[0] = b'a';
+                Ok(1)
+            }
+        }
+        let start = Instant::now();
+        let e = read_request(Drip, Duration::from_millis(100)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn allowed_peer_status_request_gets_status_json() {
+        use std::os::unix::net::UnixStream;
+        let (mut server, mut client) = UnixStream::pair().unwrap();
+        let mut c = ctx();
+        let r = prompt(&mut c, 2, "Galaxy");
+        let c = Mutex::new(c);
+        client.write_all(b"{\"cmd\":\"status\"}\n").unwrap();
+        serve_conn(&mut server, true, &c).unwrap();
+        drop(server);
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        assert!(out.ends_with('\n'));
+        let v = json(out.trim_end());
+        assert_eq!(v["pending"][0]["request_id"], r);
+        assert!(v["approved"].as_array().unwrap().is_empty());
     }
 
     #[test]

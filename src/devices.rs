@@ -2,9 +2,6 @@
 //! loading the file (missing, corrupt, oversized, too many entries, wrong
 //! owner, not a regular file) yields an empty store, never "approve all".
 
-// consumed by later tasks (gate/control/main); remove once wired
-#![allow(dead_code)]
-
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};

@@ -13,31 +13,18 @@ use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, Bulk, Direction, In, Out, TransferError};
 use nusb::{DeviceInfo, Endpoint, MaybeFuture};
 
+use crate::discovery::{self, IfaceDesc};
 use crate::log;
 use crate::packet::{self, BROADCAST, Dhcp, ETH_ARP, ETH_IPV4, Lease, Mac};
 use crate::rndis::{self, PACKET_HEADER_LEN, RX_TRANSFER};
 use crate::state::{self, PhoneInfo, global};
-use crate::sysnet::NetConfig;
+use crate::sysnet::{self, NetConfig};
 use crate::utun::Utun;
 
 const RX_QUEUE: usize = 16;
 const TX_INFLIGHT: usize = 32;
 const TX_BUFFER: usize = 2048;
 const MTU_MAX: usize = 1500;
-
-fn is_rndis_control(class: u8, subclass: u8, protocol: u8) -> bool {
-    // Android presents Wireless/RF/RNDIS; some ROMs use CDC ACM with vendor protocol.
-    (class, subclass, protocol) == (0xE0, 0x01, 0x03)
-        || (class, subclass, protocol) == (0x02, 0x02, 0xFF)
-}
-
-/// A connected device currently exposing an RNDIS interface pair.
-pub fn find_phone() -> Option<DeviceInfo> {
-    nusb::list_devices().wait().ok()?.find(|d| {
-        d.interfaces()
-            .any(|i| is_rndis_control(i.class(), i.subclass(), i.protocol()))
-    })
-}
 
 fn other<E: std::fmt::Debug>(what: &'static str) -> impl Fn(E) -> io::Error {
     move |e| io::Error::other(format!("{what}: {e:?}"))
@@ -81,16 +68,17 @@ impl Drop for StopOnUnwind {
 }
 
 pub fn run(info: DeviceInfo, quit: &AtomicBool, test: bool) -> io::Result<()> {
-    let ctrl_num = info
+    let ifaces: Vec<IfaceDesc> = info
         .interfaces()
-        .find(|i| is_rndis_control(i.class(), i.subclass(), i.protocol()))
-        .map(|i| i.interface_number())
-        .ok_or_else(|| io::Error::other("RNDIS interface vanished"))?;
-    let data_num = info
-        .interfaces()
-        .find(|i| i.class() == 0x0A)
-        .map(|i| i.interface_number())
-        .ok_or_else(|| io::Error::other("phone has no RNDIS data interface"))?;
+        .map(|i| IfaceDesc {
+            number: i.interface_number(),
+            class: i.class(),
+            subclass: i.subclass(),
+            protocol: i.protocol(),
+        })
+        .collect();
+    let (ctrl_num, data_num) = discovery::rndis_interfaces(&ifaces)
+        .ok_or_else(|| io::Error::other("RNDIS interfaces vanished"))?;
 
     let dev = info.open().wait().map_err(other("open phone"))?;
     let ctrl_if = dev
@@ -167,6 +155,13 @@ pub fn run(info: DeviceInfo, quit: &AtomicBool, test: bool) -> io::Result<()> {
             .join(", "),
         lease.lease_secs
     );
+
+    if sysnet::lease_collides(&lease, &sysnet::local_ipv4_addrs()) {
+        return Err(io::Error::other(format!(
+            "phone's lease ({} via {}) collides with an address already on this Mac; refusing it",
+            lease.ip, lease.router
+        )));
+    }
 
     let tun = Arc::new(Utun::open()?);
     let mtu = (params.max_frame as usize).clamp(576, MTU_MAX) as u32;

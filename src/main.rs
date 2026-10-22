@@ -12,6 +12,7 @@ mod control;
 mod devices;
 mod discovery;
 mod gate;
+mod launcher;
 mod packet;
 mod rndis;
 mod session;
@@ -20,10 +21,17 @@ mod sysnet;
 mod utun;
 
 use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use control::Ctx;
+use devices::{DeviceId, STORE_PATH, Store};
+use gate::{Decision, Gate};
+
+const CONSOLE_POLL: Duration = Duration::from_secs(2);
 const PIDFILE: &str = "/var/run/usbtetherd.pid";
 
 pub const VERSION: &str = match option_env!("USBTETHER_VERSION") {
@@ -96,6 +104,27 @@ fn running_pid() -> Option<i32> {
     is_usbtetherd.then_some(pid)
 }
 
+/// Run one phone session on this thread. A panic (bad input from a device)
+/// must not take the daemon down: unwinding drops the session's routes and
+/// DNS, and we go back to scanning.
+fn run_session(info: nusb::DeviceInfo, test: bool) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session::run(info, &QUIT, test)
+    }))
+    .unwrap_or_else(|_| Err(std::io::Error::other("session crashed")));
+    match result {
+        Ok(()) if !QUIT.load(Relaxed) => {
+            log!("phone disconnected; waiting for it to come back")
+        }
+        Ok(()) => {}
+        Err(e) if QUIT.load(Relaxed) => log!("{e}"),
+        Err(e) => {
+            log!("{e}; retrying in 3s");
+            thread::sleep(Duration::from_secs(3));
+        }
+    }
+}
+
 fn main() {
     if unsafe { libc::geteuid() } != 0 {
         eprintln!(
@@ -130,38 +159,79 @@ fn main() {
     }
 
     log!("usbtetherd {VERSION} starting");
-    log!("waiting for the phone — plug it in and turn on USB tethering");
-    let mut waiting_logged = true;
+    let ctx = Arc::new(Mutex::new(Ctx {
+        gate: Gate::new(),
+        store: Store::load(Path::new(STORE_PATH), 0),
+        phone: None,
+    }));
+    if let Err(e) = control::serve(ctx.clone()) {
+        log!("warning: control socket unavailable ({e}); new phones cannot be approved");
+    }
+    log!("waiting for an approved phone — plug it in and turn on USB tethering");
+
+    let mut console_prev: Option<u32> = None;
+    let mut console_polled: Option<Instant> = None;
+    let mut newly_prompted = false;
     while !QUIT.load(Relaxed) {
-        match session::find_phone() {
-            Some(info) => {
-                waiting_logged = false;
-                // A panic in a session (bad input from a device) must not
-                // take the daemon down: unwinding drops the session's routes
-                // and DNS, and we go back to waiting.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    session::run(info, &QUIT, test)
-                }))
-                .unwrap_or_else(|_| Err(std::io::Error::other("session crashed")));
-                match result {
-                    Ok(()) if !QUIT.load(Relaxed) => {
-                        log!("phone disconnected; waiting for it to come back")
+        let candidates = discovery::scan();
+        let present: Vec<DeviceId> = candidates.iter().map(|c| c.id.clone()).collect();
+        // The Ctx lock is held only for these decisions, never during a session.
+        let (decisions, pending_nonempty) = {
+            let mut c = ctx.lock().unwrap_or_else(|e| e.into_inner());
+            let Ctx { gate, store, .. } = &mut *c;
+            gate.device_gone(&present);
+            let decisions: Vec<Decision> = candidates
+                .iter()
+                .map(|cand| gate.evaluate(&cand.id, &cand.name, store))
+                .collect();
+            (decisions, !gate.pending().is_empty())
+        };
+
+        let mut ran_session = false;
+        for (cand, decision) in candidates.into_iter().zip(decisions) {
+            match decision {
+                Decision::Wait => {}
+                Decision::Prompt(_) => {
+                    log!(
+                        "unapproved device {} {:04x}:{:04x} waiting for approval",
+                        cand.name,
+                        cand.id.vid,
+                        cand.id.pid
+                    );
+                    newly_prompted = true;
+                }
+                Decision::Connect => {
+                    // Defence in depth: re-check the allowlist right before touching the phone.
+                    let still_approved = ctx
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .store
+                        .is_approved(&cand.id);
+                    if !still_approved {
+                        continue;
                     }
-                    Ok(()) => {}
-                    Err(e) if QUIT.load(Relaxed) => log!("{e}"),
-                    Err(e) => {
-                        log!("{e}; retrying in 3s");
-                        thread::sleep(Duration::from_secs(3));
-                    }
+                    ran_session = true;
+                    run_session(cand.info, test);
+                    break; // one phone at a time; rescan afterwards
                 }
             }
-            None => {
-                if !waiting_logged {
-                    log!("waiting for the phone — plug it in and turn on USB tethering");
-                    waiting_logged = true;
-                }
-                thread::sleep(Duration::from_secs(1));
+        }
+
+        if console_polled.is_none_or(|t| t.elapsed() >= CONSOLE_POLL) {
+            console_polled = Some(Instant::now());
+            let now = launcher::console_uid();
+            if launcher::should_launch(console_prev, now, newly_prompted, pending_nonempty)
+                && let Some(uid) = now
+                && let Err(e) = launcher::launch_app(uid)
+            {
+                log!("could not launch the approval app: {e}");
             }
+            console_prev = now;
+            newly_prompted = false;
+        }
+
+        if !ran_session {
+            thread::sleep(Duration::from_secs(1));
         }
     }
 

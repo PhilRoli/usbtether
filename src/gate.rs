@@ -2,9 +2,6 @@
 //! the store already approves it; anything else gets one prompt per plug-in
 //! event and waits for an explicit approve/decline by request id.
 
-// consumed by later tasks (control/main); remove once wired
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,6 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use crate::devices::{ApprovedDevice, DeviceId, Store};
+
+/// Most unapproved devices that may await a decision at once.
+const MAX_PENDING: usize = 16;
 
 pub type RequestId = String;
 
@@ -56,6 +56,9 @@ impl Gate {
             return Decision::Connect;
         }
         if self.declined.contains(id) || self.pending.iter().any(|p| p.id == *id) {
+            return Decision::Wait;
+        }
+        if self.pending.len() >= MAX_PENDING {
             return Decision::Wait;
         }
         let mut request_id = new_request_id();
@@ -235,6 +238,47 @@ mod tests {
     }
 
     #[test]
+    fn approve_store_failure_is_error_and_request_stays_pending() {
+        // Real failure: the store's parent "directory" is a regular file.
+        let d = std::env::temp_dir().join(format!(
+            "usbtether-gatetest-fail-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let blocker = d.join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let mut s = Store::load(&blocker.join("devices.json"), unsafe { libc::geteuid() });
+        let mut g = Gate::new();
+        let r = prompt(g.evaluate(&id(1), "Pixel", &s));
+        assert!(matches!(g.approve(&r, &mut s), Err(GateError::Store(_))));
+        assert!(!s.is_approved(&id(1)));
+        assert_eq!(g.pending().len(), 1);
+        assert_eq!(g.pending()[0].request_id, r);
+    }
+
+    #[test]
+    fn pending_is_capped_at_16() {
+        let s = store();
+        let mut g = Gate::new();
+        for pid in 0..16 {
+            prompt(g.evaluate(&id(pid), "d", &s));
+        }
+        assert_eq!(g.pending().len(), 16);
+        assert_eq!(g.evaluate(&id(100), "extra", &s), Decision::Wait);
+        assert_eq!(g.pending().len(), 16);
+        assert!(g.pending().iter().all(|p| p.id != id(100)));
+        // room frees up when a device leaves
+        let present: Vec<_> = (1..16).map(id).collect();
+        g.device_gone(&present);
+        assert!(matches!(
+            g.evaluate(&id(100), "extra", &s),
+            Decision::Prompt(_)
+        ));
+    }
+
+    #[test]
     fn decline_suppresses_until_unplugged() {
         let s = store();
         let mut g = Gate::new();
@@ -247,6 +291,23 @@ mod tests {
         g.device_gone(&[]);
         let r2 = prompt(g.evaluate(&id(1), "Pixel", &s));
         assert_ne!(r, r2);
+    }
+
+    #[test]
+    fn replug_invalidates_old_request_id() {
+        let mut s = store();
+        let mut g = Gate::new();
+        let old = prompt(g.evaluate(&id(1), "Pixel", &s));
+        g.device_gone(&[]);
+        let new = prompt(g.evaluate(&id(1), "Pixel", &s));
+        assert_ne!(old, new);
+        assert!(matches!(
+            g.approve(&old, &mut s),
+            Err(GateError::UnknownRequest)
+        ));
+        assert!(!s.is_approved(&id(1)));
+        assert!(matches!(g.decline(&old), Err(GateError::UnknownRequest)));
+        assert_eq!(g.pending().len(), 1);
     }
 
     #[test]

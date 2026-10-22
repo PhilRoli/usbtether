@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
+use std::net::Ipv4Addr;
+
 use crate::packet::Lease;
 
 const SVC: &str = "State:/Network/Service/usbtether";
@@ -154,5 +156,78 @@ impl Drop for NetConfig {
                 ],
             );
         }
+    }
+}
+
+/// Every IPv4 address currently configured on any local interface.
+pub fn local_ipv4_addrs() -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return out;
+    }
+    let mut cur = list;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned, valid until freeifaddrs.
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET {
+            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            out.push(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+        }
+        cur = ifa.ifa_next;
+    }
+    unsafe { libc::freeifaddrs(list) };
+    out
+}
+
+/// True if the phone's lease would hand us, or point us at, an address this
+/// Mac already uses. Mere subnet overlap is fine: the tether only installs /1
+/// routes and a /32 host route.
+pub fn lease_collides(lease: &Lease, local: &[Ipv4Addr]) -> bool {
+    local.contains(&lease.ip) || local.contains(&lease.router)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn lease(ip: [u8; 4], router: [u8; 4]) -> Lease {
+        Lease {
+            ip: Ipv4Addr::from(ip),
+            mask: Ipv4Addr::new(255, 255, 255, 0),
+            router: Ipv4Addr::from(router),
+            dns: vec![],
+            lease_secs: 3600,
+            server: Ipv4Addr::from(router),
+            server_mac: [0; 6],
+        }
+    }
+
+    #[test]
+    fn lease_colliding_with_local_address_is_rejected() {
+        let local = [Ipv4Addr::new(192, 168, 1, 10)];
+        assert!(lease_collides(
+            &lease([192, 168, 1, 10], [192, 168, 42, 129]),
+            &local
+        ));
+        assert!(lease_collides(
+            &lease([192, 168, 42, 5], [192, 168, 1, 10]),
+            &local
+        ));
+    }
+
+    #[test]
+    fn same_subnet_different_host_is_allowed() {
+        let local = [Ipv4Addr::new(192, 168, 1, 10)];
+        assert!(!lease_collides(
+            &lease([192, 168, 1, 77], [192, 168, 1, 1]),
+            &local
+        ));
+    }
+
+    #[test]
+    fn empty_local_list_never_collides() {
+        assert!(!lease_collides(&lease([10, 0, 0, 2], [10, 0, 0, 1]), &[]));
     }
 }
