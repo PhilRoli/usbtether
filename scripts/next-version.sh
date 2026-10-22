@@ -9,6 +9,11 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
     exit 1
 fi
 
+if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+    echo "next-version.sh: shallow clone, tags may be missing (fetch with full history)" >&2
+    exit 1
+fi
+
 latest=""
 while IFS= read -r tag; do
     if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
