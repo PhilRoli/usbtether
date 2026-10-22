@@ -2,6 +2,7 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    target-branch: develop
     schedule:
       interval: weekly
     # Freshly published crate versions wait a few days before a PR is opened.
@@ -12,5 +13,6 @@ updates:
         update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
+    target-branch: develop
     schedule:
       interval: monthly
