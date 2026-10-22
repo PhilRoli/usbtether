@@ -28,8 +28,8 @@ if [ "$UNIVERSAL" = "1" ]; then
             exit 1
         fi
     done
-    cargo build --release --target aarch64-apple-darwin
-    cargo build --release --target x86_64-apple-darwin
+    cargo build --locked --release --target aarch64-apple-darwin
+    cargo build --locked --release --target x86_64-apple-darwin
     DAEMON_BIN="$REPO/build/usbtetherd.universal"
     mkdir -p "$REPO/build"
     lipo -create -output "$DAEMON_BIN" \
@@ -38,7 +38,7 @@ if [ "$UNIVERSAL" = "1" ]; then
     (cd app && swift build -c release --arch arm64 --arch x86_64)
     APP_BIN="$(cd app && swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/UsbTether"
 else
-    cargo build --release
+    cargo build --locked --release
     DAEMON_BIN="$TARGET_DIR/release/usbtetherd"
     (cd app && swift build -c release)
     APP_BIN="$(cd app && swift build -c release --show-bin-path)/UsbTether"

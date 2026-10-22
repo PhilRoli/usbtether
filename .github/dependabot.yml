@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Freshly published crate versions wait a few days before a PR is opened.
+    cooldown:
+      default-days: 3
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]

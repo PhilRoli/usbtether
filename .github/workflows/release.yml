@@ -1,8 +1,13 @@
 name: Release
 
 # Releases are manual: push a vX.Y.Z[-suffix] tag. Prerelease tags skip the tap.
-# If publish fails after the release exists, delete the release and re-run, or
-# finish the cask update by hand. workflow_dispatch only does a dry run (build).
+# workflow_dispatch only does a dry run (build).
+# If publish fails after the release was created (a failed asset upload leaves a
+# stray draft), delete only the release, keeping the tag:
+#   gh release delete vX.Y.Z      (no --cleanup-tag)
+# then use "Re-run failed jobs". Or finish the cask by hand in a tap checkout:
+#   <usbtether>/scripts/update-cask.py Casks/usbtether.rb X.Y.Z <sha from the release notes>
+# and commit and push there.
 on:
   push:
     tags: ['v[0-9]*']
@@ -38,7 +43,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - run: cargo test
+      - run: cargo test --locked
 
       - run: swift test
         working-directory: app
@@ -129,7 +134,7 @@ jobs:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           [ -f homebrew-tap/Casks/usbtether.rb ] || { echo "usbtether.rb not found in tap" >&2; exit 1; }
-          encoded="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64)"
+          encoded="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')"
           header="AUTHORIZATION: basic $encoded"
           echo "::add-mask::$encoded"
           echo "::add-mask::$header"
@@ -150,12 +155,14 @@ jobs:
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          scripts/update-cask.py homebrew-tap/Casks/usbtether.rb "$VERSION" "$(cat "$RUNNER_TEMP/sha256")"
-          # The auth header is only exported once the token-free updater has run.
-          encoded="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64)"
+          # Build the auth header into unexported variables and drop the token from the
+          # environment, so the updater runs without it; git gets the header afterwards.
+          encoded="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')"
           header="AUTHORIZATION: basic $encoded"
           echo "::add-mask::$encoded"
           echo "::add-mask::$header"
+          unset TAP_TOKEN
+          scripts/update-cask.py homebrew-tap/Casks/usbtether.rb "$VERSION" "$(cat "$RUNNER_TEMP/sha256")"
           export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$header"
           cd homebrew-tap
           git config user.name "github-actions[bot]"
