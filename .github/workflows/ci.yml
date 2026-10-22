@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    name: ci
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Rustfmt
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Cargo test
+        run: cargo test
+
+      - name: Swift build
+        working-directory: app
+        run: swift build
+
+      - name: Swift test
+        working-directory: app
+        run: swift test --parallel
+
+      - name: Install SwiftLint
+        run: brew install swiftlint
+
+      - name: SwiftLint
+        working-directory: app
+        run: swiftlint --strict
+
+      - name: Install shellcheck
+        run: command -v shellcheck >/dev/null || brew install shellcheck
+
+      - name: Packaging tests
+        run: scripts/test-packaging.sh
+
+      - name: Universal packaging smoke test
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          UNIVERSAL=1 scripts/package.sh 0.0.0-ci
