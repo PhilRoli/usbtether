@@ -26,17 +26,34 @@ cleanup_on_failure() {
 # Homebrew quarantines the cask download (whose checksum it has just verified) and install(1)
 # copies the flag, so Gatekeeper could refuse the unnotarized daemon and app. Strip it from the
 # verified root-owned daemon, and from the enclosing app only when this script runs from
-# <dir>/UsbTether.app/Contents/Resources. -s: never follow a symlink out of the bundle.
+# <dir>/UsbTether.app/Contents/Resources and that path holds no symlinks. -s: never follow a
+# symlink. As real root the recursive strip over the (user-writable) bundle runs as the bundle's
+# owner, so it can only touch what that user owns already; a root-owned bundle (or an odd owner
+# name) only gets the bundle directory and its executable stripped, non-recursively.
 strip_quarantine() { # strip_quarantine <installed daemon> <script dir>
     /usr/bin/xattr -d com.apple.quarantine "$1" 2>/dev/null || true
     case "$2" in
-        */UsbTether.app/Contents/Resources)
-            local app="${2%/Contents/Resources}"
-            if [ -d "$app" ] && [ ! -L "$app" ]; then
-                /usr/bin/xattr -drs com.apple.quarantine "$app" 2>/dev/null || true
-            fi
-            ;;
+        */UsbTether.app/Contents/Resources) ;;
+        *) return 0 ;;
     esac
+    local app="${2%/Contents/Resources}" p owner
+    for p in "$app" "$app/Contents" "$app/Contents/Resources"; do
+        if [ ! -d "$p" ] || [ -L "$p" ]; then
+            return 0
+        fi
+    done
+    if [ "$(id -u)" -ne 0 ]; then
+        # Test mode (USBTETHER_ROOT as a normal user): the strip already runs as the owner.
+        /usr/bin/xattr -drs com.apple.quarantine "$app" 2>/dev/null || true
+        return 0
+    fi
+    owner="$(/usr/bin/stat -f %Su "$app" 2>/dev/null || true)"
+    if [ "$owner" != root ] && [[ "$owner" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*$ ]]; then
+        /usr/bin/sudo -n -u "$owner" /usr/bin/xattr -drs com.apple.quarantine "$app" 2>/dev/null || true
+    else
+        /usr/bin/xattr -ds com.apple.quarantine "$app" 2>/dev/null || true
+        /usr/bin/xattr -ds com.apple.quarantine "$app/Contents/MacOS/UsbTether" 2>/dev/null || true
+    fi
 }
 
 main() {

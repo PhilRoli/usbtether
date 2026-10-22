@@ -118,6 +118,18 @@ check "installed daemon has no quarantine flag" no_quarantine "$ROOT5/Library/Pr
 check "app bundle has no quarantine flag" no_quarantine "$QAPP"
 check "app executable has no quarantine flag" no_quarantine "$QAPP/Contents/MacOS/UsbTether"
 check "symlink target outside the bundle keeps its flag" has_quarantine "$QOUT"
+# A symlinked app directory is skipped: no error, the link target keeps its flag.
+QREAL="$TMP/real/Other.app"; mkdir -p "$TMP/real" "$TMP/apps2"; cp -R "$QAPP" "$QREAL"
+rm -f "$QREAL/Contents/link-outside"
+xattr -w com.apple.quarantine "0081;00000000;Test;" "$QREAL"
+xattr -w com.apple.quarantine "0081;00000000;Test;" "$QREAL/Contents/MacOS/UsbTether"
+ln -s "$QREAL" "$TMP/apps2/UsbTether.app"
+ROOT8="$TMP/root8"; mkdir -p "$ROOT8"
+check "install via symlinked app dir exits 0" env USBTETHER_ROOT="$ROOT8" "$TMP/apps2/UsbTether.app/Contents/Resources/install-daemon.sh"
+check "symlinked app dir keeps its flag" has_quarantine "$QREAL"
+check "symlinked app's executable keeps its flag" has_quarantine "$QREAL/Contents/MacOS/UsbTether"
+check "daemon from symlinked app dir has no quarantine flag" no_quarantine "$ROOT8/Library/PrivilegedHelperTools/usbtetherd"
+
 # Not inside UsbTether.app/Contents/Resources: the script's surroundings are left alone.
 QFAKE="$TMP/qfake"; cp -R "$FAKE" "$QFAKE"; xattr -w com.apple.quarantine "0081;00000000;Test;" "$QFAKE"
 xattr -w com.apple.quarantine "0081;00000000;Test;" "$QFAKE/usbtetherd"
