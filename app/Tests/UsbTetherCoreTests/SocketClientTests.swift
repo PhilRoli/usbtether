@@ -50,6 +50,8 @@ final class FakeServer: @unchecked Sendable {
                 }
                 lock.lock(); received = got; lock.unlock()
             }
+            // An empty reply means "accept, then say nothing for a while".
+            if reply.isEmpty { Thread.sleep(forTimeInterval: 1) }
             reply.withUnsafeBytes { raw in
                 var off = 0
                 while off < raw.count {
@@ -133,6 +135,17 @@ final class SocketClientTests: XCTestCase {
             XCTFail("expected throw")
         } catch let error as DaemonError {
             XCTAssertEqual(error, .refused("not allowed"))
+        }
+    }
+
+    func testSilentDaemonIsTimedOut() async throws {
+        let server = try FakeServer(reply: Data())
+        defer { server.finish() }
+        do {
+            _ = try await SocketDaemonClient(path: server.path, timeout: 0.2).status()
+            XCTFail("expected throw")
+        } catch let error as DaemonError {
+            XCTAssertEqual(error, .timedOut)
         }
     }
 

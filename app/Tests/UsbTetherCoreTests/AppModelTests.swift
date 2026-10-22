@@ -20,6 +20,62 @@ final class FakeClient: DaemonClient, @unchecked Sendable {
     func remove(_ phone: ApprovedPhone) async throws -> DaemonStatus { try answer("remove:\(phone.name)") }
 }
 
+/// First `status()` blocks until released; every other call answers `later`.
+final class GatedClient: DaemonClient, @unchecked Sendable {
+    private let first: DaemonStatus
+    private let later: DaemonStatus
+    private let lock = NSLock()
+    private var firstTaken = false
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var entered: CheckedContinuation<Void, Never>?
+    private var hasEntered = false
+
+    init(first: DaemonStatus, later: DaemonStatus) {
+        self.first = first
+        self.later = later
+    }
+
+    func waitForFirstCall() async {
+        await withCheckedContinuation { register($0) }
+    }
+
+    func releaseFirst() {
+        lock.lock(); let cont = continuation; continuation = nil; lock.unlock()
+        cont?.resume()
+    }
+
+    private func takeFirst() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let isFirst = !firstTaken
+        firstTaken = true
+        return isFirst
+    }
+
+    private func park(_ cont: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        continuation = cont
+        hasEntered = true
+        let waiter = entered; entered = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    private func register(_ cont: CheckedContinuation<Void, Never>) {
+        lock.lock()
+        if hasEntered { lock.unlock(); cont.resume() } else { entered = cont; lock.unlock() }
+    }
+
+    func status() async throws -> DaemonStatus {
+        guard takeFirst() else { return later }
+        await withCheckedContinuation { park($0) }
+        return first
+    }
+
+    func approve(_ requestID: String) async throws -> DaemonStatus { later }
+    func decline(_ requestID: String) async throws -> DaemonStatus { later }
+    func remove(_ phone: ApprovedPhone) async throws -> DaemonStatus { later }
+}
+
 func pending(_ id: String) -> PendingPhone {
     PendingPhone(requestID: id, name: "Pixel \(id)", vid: 0x18d1, pid: 0x4ee1, serial: "S\(id)")
 }
@@ -43,7 +99,7 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(client: client)
         await model.refresh()
         client.nextStatus = .success(status())
-        await model.approve()
+        await model.approve(pending("a"))
         XCTAssertNil(model.prompt)
         XCTAssertEqual(client.calls, ["status", "approve:a"])
     }
@@ -53,17 +109,56 @@ final class AppModelTests: XCTestCase {
         let model = AppModel(client: client)
         await model.refresh()
         client.nextStatus = .success(status())
-        await model.decline()
+        await model.decline(pending("a"))
         XCTAssertNil(model.prompt)
         XCTAssertEqual(client.calls, ["status", "decline:a"])
     }
 
-    func testApproveWithoutPromptIsNoOp() async {
-        let client = FakeClient(.success(status()))
+    func testApprovingVanishedPhoneSendsNothingAndRefreshes() async {
+        let client = FakeClient(.success(status(pending: [pending("a")])))
         let model = AppModel(client: client)
-        await model.approve()
-        await model.decline()
-        XCTAssertEqual(client.calls, [])
+        await model.refresh()
+        client.nextStatus = .success(status())
+        await model.refresh()
+        await model.approve(pending("a"))
+        await model.decline(pending("a"))
+        XCTAssertEqual(client.calls, ["status", "status", "status", "status"])
+        XCTAssertNil(model.prompt)
+    }
+
+    func testApproveActsOnTheClickedPhoneEvenIfPendingChanged() async {
+        let client = FakeClient(.success(status(pending: [pending("a")])))
+        let model = AppModel(client: client)
+        await model.refresh()
+        let shown = model.prompt!
+        client.nextStatus = .success(status(pending: [pending("b"), pending("a")]))
+        await model.refresh()
+        XCTAssertEqual(model.prompt?.requestID, "b")
+        await model.approve(shown)
+        XCTAssertEqual(client.calls.last, "approve:a")
+    }
+
+    func testStaleRefreshDoesNotOverwriteNewerApproveReply() async {
+        let gated = GatedClient(first: status(pending: [pending("a")]), later: status())
+        let model = AppModel(client: gated)
+        model.status = status(pending: [pending("a")])
+        let slow = Task { await model.refresh() }
+        await gated.waitForFirstCall()
+        await model.approve(pending("a"))
+        XCTAssertNil(model.prompt)
+        gated.releaseFirst()
+        await slow.value
+        XCTAssertNil(model.prompt, "stale refresh must not resurrect the prompt")
+    }
+
+    func testTimedOutKeepsStatusAndSetsProblem() async {
+        let client = FakeClient(.success(status(pending: [pending("a")])))
+        let model = AppModel(client: client)
+        await model.refresh()
+        client.nextStatus = .failure(.timedOut)
+        await model.refresh()
+        XCTAssertNotNil(model.status)
+        XCTAssertEqual(model.problem, "usbtetherd did not answer in time. Try again.")
     }
 
     func testRemoveUpdatesStatus() async {

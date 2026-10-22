@@ -9,9 +9,11 @@ public struct SocketDaemonClient: DaemonClient {
                                              attributes: .concurrent)
 
     public let path: String
+    public let timeout: TimeInterval
 
-    public init(path: String = "/var/run/usbtether.sock") {
+    public init(path: String = "/var/run/usbtether.sock", timeout: TimeInterval = 2) {
         self.path = path
+        self.timeout = timeout
     }
 
     public func status() async throws -> DaemonStatus {
@@ -36,9 +38,10 @@ public struct SocketDaemonClient: DaemonClient {
         line.append(0x0a)
         let payload = line
         let path = self.path
+        let timeout = self.timeout
         let reply: Data = try await withCheckedThrowingContinuation { continuation in
             Self.queue.async {
-                continuation.resume(with: Result { try Self.exchange(path: path, request: payload) })
+                continuation.resume(with: Result { try Self.exchange(path: path, timeout: timeout, request: payload) })
             }
         }
         return try Self.decode(reply)
@@ -57,17 +60,18 @@ public struct SocketDaemonClient: DaemonClient {
     }
 
     /// Returns the reply line without its newline.
-    static func exchange(path: String, request: Data) throws -> Data {
+    static func exchange(path: String, timeout: TimeInterval, request: Data) throws -> Data {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw DaemonError.unavailable }
         defer { close(fd) }
 
         // A stuck daemon must not hang us, and a daemon that closes early
         // must not kill the app with SIGPIPE.
-        var timeout = timeval(tv_sec: 2, tv_usec: 0)
+        var tv = timeval(tv_sec: Int(timeout),
+                         tv_usec: Int32((timeout - timeout.rounded(.down)) * 1_000_000))
         let tvSize = socklen_t(MemoryLayout<timeval>.size)
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, tvSize)
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, tvSize)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, tvSize)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, tvSize)
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
 
@@ -90,6 +94,10 @@ public struct SocketDaemonClient: DaemonClient {
         return try readLine(fd)
     }
 
+    private static func ioError() -> DaemonError {
+        errno == EAGAIN || errno == EWOULDBLOCK ? .timedOut : .unavailable
+    }
+
     private static func writeAll(_ fd: Int32, _ data: Data) throws {
         try data.withUnsafeBytes { raw in
             var offset = 0
@@ -97,7 +105,7 @@ public struct SocketDaemonClient: DaemonClient {
                 let written = write(fd, raw.baseAddress! + offset, raw.count - offset)
                 if written < 0 {
                     if errno == EINTR { continue }
-                    throw DaemonError.unavailable
+                    throw ioError()
                 }
                 if written == 0 { throw DaemonError.unavailable }
                 offset += written
@@ -112,7 +120,7 @@ public struct SocketDaemonClient: DaemonClient {
             let count = read(fd, &buffer, buffer.count)
             if count < 0 {
                 if errno == EINTR { continue }
-                throw DaemonError.unavailable
+                throw ioError()
             }
             // EOF before a newline: the reply is incomplete.
             if count == 0 { throw DaemonError.badReply }

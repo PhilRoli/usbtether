@@ -77,6 +77,8 @@ public struct DaemonStatus: Decodable, Equatable, Sendable {
 public enum DaemonError: Error, Equatable, Sendable {
     /// Cannot reach the daemon (no socket, connection refused, timeout).
     case unavailable
+    /// The daemon accepted the connection but did not read or answer in time.
+    case timedOut
     /// The daemon replied `{"error": ...}`.
     case refused(String)
     /// The reply was empty, oversized, unterminated or not the expected JSON.
