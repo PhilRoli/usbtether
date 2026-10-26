@@ -34,32 +34,66 @@ pub struct Store {
     devices: Vec<ApprovedDevice>,
 }
 
-fn read_devices(path: &Path, owner_uid: u32) -> Option<Vec<ApprovedDevice>> {
+/// The approved devices in the file; an empty list if there is no file yet.
+/// Any other problem is an error naming it.
+fn read_devices(path: &Path, owner_uid: u32) -> Result<Vec<ApprovedDevice>, String> {
     // O_NOFOLLOW: a symlink at the path fails to open; fstat the opened fd so
     // the checks apply to the file actually read.
-    let file = OpenOptions::new()
+    let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() || meta.uid() != owner_uid || meta.len() > MAX_FILE_BYTES {
-        return None;
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("cannot open it: {e}")),
+    };
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.uid() != owner_uid {
+        return Err(format!("owned by uid {}, not {owner_uid}", meta.uid()));
     }
     let mut buf = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf).ok()?;
+    file.take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
     if buf.len() as u64 > MAX_FILE_BYTES {
-        return None;
+        return Err(format!("larger than {MAX_FILE_BYTES} bytes"));
     }
-    let devices: Vec<ApprovedDevice> = serde_json::from_slice(&buf).ok()?;
-    (devices.len() <= MAX_ENTRIES).then_some(devices)
+    let devices: Vec<ApprovedDevice> = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+    if devices.len() > MAX_ENTRIES {
+        return Err(format!("more than {MAX_ENTRIES} entries"));
+    }
+    Ok(devices)
+}
+
+fn rejected_path(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".rejected");
+    PathBuf::from(p)
 }
 
 impl Store {
+    /// A file that cannot be trusted is logged and moved aside (so the next
+    /// save does not destroy it), and the store starts empty.
     pub fn load(path: &Path, owner_uid: u32) -> Store {
+        let devices = read_devices(path, owner_uid).unwrap_or_else(|why| {
+            let aside = rejected_path(path);
+            let moved = match fs::rename(path, &aside) {
+                Ok(()) => format!("moved to {}", aside.display()),
+                Err(e) => format!("could not move it aside: {e}"),
+            };
+            crate::log!(
+                "ignoring approved-phone list {} ({why}); {moved}; no phone is approved",
+                path.display()
+            );
+            Vec::new()
+        });
         Store {
             path: path.to_path_buf(),
-            devices: read_devices(path, owner_uid).unwrap_or_default(),
+            devices,
         }
     }
 
@@ -239,6 +273,7 @@ mod tests {
             let p = d.join(n);
             fs::write(&p, body).unwrap();
             assert!(Store::load(&p, uid()).list().is_empty(), "{n}");
+            assert!(!p.exists(), "{n}");
         }
         // sanity: 64 entries is accepted
         let p = d.join("ok");
@@ -260,7 +295,8 @@ mod tests {
         let mut s = Store::load(&p, uid());
         s.add(dev(id(1, 2, Some("A")), "a")).unwrap();
         assert!(Store::load(&p, uid().wrapping_add(1)).list().is_empty());
-        assert_eq!(Store::load(&p, uid()).list().len(), 1);
+        assert!(!p.exists(), "the untrusted file is moved aside");
+        assert_eq!(Store::load(&rejected_path(&p), uid()).list().len(), 1);
     }
 
     #[test]
@@ -287,5 +323,15 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["devices.json".to_string()]);
+    }
+
+    #[test]
+    fn rejected_file_survives_the_next_save() {
+        let p = tmpdir().join("devices.json");
+        fs::write(&p, "not json").unwrap();
+        let mut s = Store::load(&p, uid());
+        s.add(dev(id(1, 2, Some("A")), "a")).unwrap();
+        assert_eq!(fs::read_to_string(rejected_path(&p)).unwrap(), "not json");
+        assert_eq!(Store::load(&p, uid()).list().len(), 1);
     }
 }
