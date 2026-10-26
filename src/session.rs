@@ -13,11 +13,11 @@ use nusb::descriptors::TransferType;
 use nusb::transfer::{Buffer, Bulk, Direction, In, Out, TransferError};
 use nusb::{DeviceInfo, Endpoint, MaybeFuture};
 
-use crate::discovery::{self, IfaceDesc};
+use crate::discovery;
 use crate::log;
 use crate::packet::{self, BROADCAST, Dhcp, ETH_ARP, ETH_IPV4, Lease, Mac};
 use crate::rndis::{self, PACKET_HEADER_LEN, RX_TRANSFER};
-use crate::state::{self, PhoneInfo, global};
+use crate::state::{PhoneInfo, global};
 use crate::sysnet::{self, NetConfig};
 use crate::utun::Utun;
 
@@ -71,16 +71,7 @@ impl Drop for StopOnUnwind {
 /// removed; it ends the session like an unplug. The caller resets it to false
 /// (under the Ctx lock) before starting the session.
 pub fn run(info: DeviceInfo, quit: &AtomicBool, revoke: &AtomicBool, test: bool) -> io::Result<()> {
-    let ifaces: Vec<IfaceDesc> = info
-        .interfaces()
-        .map(|i| IfaceDesc {
-            number: i.interface_number(),
-            class: i.class(),
-            subclass: i.subclass(),
-            protocol: i.protocol(),
-        })
-        .collect();
-    let (ctrl_num, data_num) = discovery::rndis_interfaces(&ifaces)
+    let (ctrl_num, data_num) = discovery::rndis_interfaces(&discovery::iface_descs(&info))
         .ok_or_else(|| io::Error::other("RNDIS interfaces vanished"))?;
 
     let dev = info.open().wait().map_err(other("open phone"))?;
@@ -198,7 +189,7 @@ pub fn run(info: DeviceInfo, quit: &AtomicBool, revoke: &AtomicBool, test: bool)
     // Bounded: a phone flooding ARP requests must not grow root's memory.
     let (frames_tx, frames_rx) = mpsc::sync_channel::<Vec<u8>>(256);
 
-    *global().phone.lock().unwrap() = Some(PhoneInfo {
+    *global().phone.lock().unwrap_or_else(|e| e.into_inner()) = Some(PhoneInfo {
         ip: lease.ip.to_string(),
         router: lease.router.to_string(),
         ifname: tun.name.clone(),
@@ -250,7 +241,7 @@ pub fn run(info: DeviceInfo, quit: &AtomicBool, revoke: &AtomicBool, test: bool)
     shared.stop.store(true, Relaxed);
     let _ = rx.join();
     let _ = tx.join();
-    *global().phone.lock().unwrap() = None;
+    *global().phone.lock().unwrap_or_else(|e| e.into_inner()) = None;
     drop(net);
     let secs = started.elapsed().as_secs().max(1);
     log!(
@@ -388,7 +379,7 @@ fn rx_loop(
                     if let Some((m, ip)) = packet::arp_sender(f)
                         && ip == lease.router
                     {
-                        *sh.gw_mac.lock().unwrap() = m;
+                        *sh.gw_mac.lock().unwrap_or_else(|e| e.into_inner()) = m;
                     }
                 }
                 ETH_IPV4 => {
@@ -411,7 +402,6 @@ fn rx_loop(
                     }
                     if let Some(ip) = packet::ipv4_payload(f) {
                         sh.rx_bytes.fetch_add(ip.len() as u64, Relaxed);
-                        state::add(&global().usb_rx, ip.len());
                         if let Err(e) = tun.write_ipv4(ip) {
                             log!("utun write: {e}");
                         }
@@ -536,12 +526,16 @@ fn tx_loop(
             continue;
         }
         let mut eth = Vec::with_capacity(14);
-        packet::eth_header(&mut eth, &sh.gw_mac.lock().unwrap(), &mac, ETH_IPV4);
+        packet::eth_header(
+            &mut eth,
+            &sh.gw_mac.lock().unwrap_or_else(|e| e.into_inner()),
+            &mac,
+            ETH_IPV4,
+        );
         for _ in 0..64 {
             match tun.read_ipv4(&mut pkt) {
                 Ok(Some(ip)) if ip.len() <= MTU_MAX => {
                     sh.tx_bytes.fetch_add(ip.len() as u64, Relaxed);
-                    state::add(&global().usb_tx, ip.len());
                     if !out.send(sh, &eth, ip) {
                         break 'outer;
                     }

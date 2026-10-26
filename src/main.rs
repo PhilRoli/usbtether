@@ -50,7 +50,7 @@ extern "C" fn on_signal(_: libc::c_int) {
 const LOG_PATH: &str = "/var/log/usbtether.log";
 const LOG_MAX: i64 = 1_000_000;
 
-/// Write one timestamped line to stderr. Never panics: a full disk or a
+/// Write one line, stamped with the local date and time, to stderr. Never panics: a full disk or a
 /// closed log must not take down whichever thread is logging.
 pub fn log_line(args: std::fmt::Arguments) {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
@@ -59,8 +59,13 @@ pub fn log_line(args: std::fmt::Arguments) {
         libc::localtime_r(&t, &mut tm);
     }
     let line = format!(
-        "{:02}:{:02}:{:02} {args}\n",
-        tm.tm_hour, tm.tm_min, tm.tm_sec
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} {args}\n",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
     );
     let _ = io::stderr().write_all(line.as_bytes());
     rotate_log();

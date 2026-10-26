@@ -40,6 +40,17 @@ pub fn rndis_interfaces(ifaces: &[IfaceDesc]) -> Option<(u8, u8)> {
     Some((control.number, chosen.number))
 }
 
+pub fn iface_descs(info: &nusb::DeviceInfo) -> Vec<IfaceDesc> {
+    info.interfaces()
+        .map(|i| IfaceDesc {
+            number: i.interface_number(),
+            class: i.class(),
+            subclass: i.subclass(),
+            protocol: i.protocol(),
+        })
+        .collect()
+}
+
 const MAX_NAME_PART: usize = 64;
 
 /// Device-controlled strings end up in logs and an approval dialog: strip
@@ -99,16 +110,7 @@ pub fn scan() -> Vec<Candidate> {
     };
     devices
         .filter_map(|info| {
-            let ifaces: Vec<IfaceDesc> = info
-                .interfaces()
-                .map(|i| IfaceDesc {
-                    number: i.interface_number(),
-                    class: i.class(),
-                    subclass: i.subclass(),
-                    protocol: i.protocol(),
-                })
-                .collect();
-            rndis_interfaces(&ifaces)?;
+            rndis_interfaces(&iface_descs(&info))?;
             let (vid, pid) = (info.vendor_id(), info.product_id());
             Some(Candidate {
                 id: DeviceId {

@@ -20,12 +20,12 @@ mode_is() { [ "$(stat -f '%Lp' "$1" 2>/dev/null)" = "$2" ]; }
 not_loose() { [ $(( 8#$(stat -f '%Lp' "$1") & 8#022 )) -eq 0 ]; } # not group/world-writable
 no_loose_files() { [ -z "$(find "$1" -perm +022)" ]; }
 
-# Stand-in daemon so install/uninstall tests do not need a build.
+# Stand-in daemon so install tests do not need a build.
 FAKE="$TMP/fake-resources"
 mkdir -p "$FAKE"
 printf '#!/bin/sh\nexit 0\n' > "$FAKE/usbtetherd"
 chmod 755 "$FAKE/usbtetherd"
-cp packaging/install-daemon.sh packaging/uninstall-daemon.sh packaging/com.philipp.usbtether.plist "$FAKE/" 2>/dev/null
+cp packaging/install-daemon.sh packaging/com.philipp.usbtether.plist "$FAKE/" 2>/dev/null
 
 ROOT="$TMP/root"
 mkdir -p "$ROOT"
@@ -46,18 +46,6 @@ check "log created" test -f "$ROOT/var/log/usbtether.log"
 check "log mode 640" mode_is "$ROOT/var/log/usbtether.log" 640
 check "install run 2 (idempotent) exits 0" "$FAKE/install-daemon.sh"
 check "daemon still present after rerun" test -f "$DAEMON"
-
-touch "$APPSUP/allowed.json"
-mkdir -p "$ROOT/var/run"
-touch "$ROOT/var/run/usbtether.sock" "$ROOT/var/run/usbtetherd.pid"
-check "uninstall run 1 exits 0" "$FAKE/uninstall-daemon.sh"
-check "daemon removed" test ! -e "$DAEMON"
-check "plist removed" test ! -e "$PLIST"
-check "pidfile removed" test ! -e "$ROOT/var/run/usbtetherd.pid"
-check "log survives uninstall" test -f "$ROOT/var/log/usbtether.log"
-check "socket removed" test ! -e "$ROOT/var/run/usbtether.sock"
-check "uninstall run 2 exits 0" "$FAKE/uninstall-daemon.sh"
-check "Application Support left alone" test -f "$APPSUP/allowed.json"
 
 # Existing system dirs must never be altered (stock PrivilegedHelperTools is 1755).
 ROOT2="$TMP/root2"
@@ -164,7 +152,7 @@ check "package.sh 0.0.0-test" env UNIVERSAL=0 scripts/package.sh 0.0.0-test
 APP="build/UsbTether.app"
 check "app executable" test -x "$APP/Contents/MacOS/UsbTether"
 check "Info.plist present" test -f "$APP/Contents/Info.plist"
-for f in usbtetherd install-daemon.sh uninstall-daemon.sh; do
+for f in usbtetherd install-daemon.sh; do
     check "Resources/$f executable" test -x "$APP/Contents/Resources/$f"
 done
 check "Resources/com.philipp.usbtether.plist" test -f "$APP/Contents/Resources/com.philipp.usbtether.plist"

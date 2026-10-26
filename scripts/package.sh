@@ -53,9 +53,9 @@ rm -rf "$APP" "$REPO/build/UsbTether-$VERSION.zip"
 mkdir -p "$APP/Contents/MacOS" "$RES"
 cp "$APP_BIN" "$APP/Contents/MacOS/UsbTether"
 cp "$DAEMON_BIN" "$RES/usbtetherd"
-cp packaging/install-daemon.sh packaging/uninstall-daemon.sh \
+cp packaging/install-daemon.sh \
    packaging/com.philipp.usbtether.plist packaging/AppIcon.icns "$RES/"
-chmod 755 "$APP/Contents/MacOS/UsbTether" "$RES/usbtetherd" "$RES/install-daemon.sh" "$RES/uninstall-daemon.sh"
+chmod 755 "$APP/Contents/MacOS/UsbTether" "$RES/usbtetherd" "$RES/install-daemon.sh"
 sed -e "s/\$(VERSION)/$VERSION/g" -e "s/\$(BUILD_VERSION)/$BUILD_VERSION/g" \
     packaging/Info.plist > "$APP/Contents/Info.plist"
 rm -f "$REPO/build/usbtetherd.universal"

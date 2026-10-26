@@ -22,7 +22,6 @@ const MSG_QUERY: u32 = 0x0000_0004;
 const MSG_QUERY_C: u32 = 0x8000_0004;
 const MSG_SET: u32 = 0x0000_0005;
 const MSG_SET_C: u32 = 0x8000_0005;
-const MSG_INDICATE: u32 = 0x0000_0007;
 const MSG_KEEPALIVE: u32 = 0x0000_0008;
 const MSG_KEEPALIVE_C: u32 = 0x8000_0008;
 
@@ -127,8 +126,9 @@ impl Control {
                     let reply = msg(&[MSG_KEEPALIVE_C, 16, le32(&r, 8), 0]);
                     let _ = self.send(&reply);
                 }
-                // INDICATE_STATUS (link up/down) or a stale reply: keep polling.
-                if t == MSG_INDICATE || t != expect {
+                // Any other message (INDICATE_STATUS, a keepalive, a stale
+                // reply): poll again at once, the reply may be queued behind it.
+                if t != expect {
                     continue;
                 }
             }

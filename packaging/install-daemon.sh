@@ -7,7 +7,8 @@
 set -euo pipefail
 
 
-# Compares the installed daemon with the vetted source; on mismatch removes it and the plist.
+# Compares the installed daemon with its source; on mismatch removes it and the plist. This only
+# catches the source changing during the copy, not a source swapped before it (see the header).
 verify_daemon() { # verify_daemon <source> <installed daemon> <installed plist>
     if ! cmp -s "$1" "$2"; then
         rm -f "$2" "$3"
