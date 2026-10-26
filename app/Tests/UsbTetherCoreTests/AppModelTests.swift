@@ -20,19 +20,28 @@ final class FakeClient: DaemonClient, @unchecked Sendable {
     func remove(_ phone: ApprovedPhone) async throws -> DaemonStatus { try answer("remove:\(phone.name)") }
 }
 
-/// First `status()` blocks until released; every other call answers `later`.
+/// The first call named `gated` blocks until released, then answers `first`; every other
+/// call answers `later` at once.
 final class GatedClient: DaemonClient, @unchecked Sendable {
-    private let first: DaemonStatus
+    private let gated: String
+    private let first: Result<DaemonStatus, DaemonError>
     private let later: DaemonStatus
     private let lock = NSLock()
     private var firstTaken = false
+    private var recorded: [String] = []
     private var continuation: CheckedContinuation<Void, Never>?
     private var entered: CheckedContinuation<Void, Never>?
     private var hasEntered = false
 
-    init(first: DaemonStatus, later: DaemonStatus) {
+    init(gated: String = "status", first: Result<DaemonStatus, DaemonError>, later: DaemonStatus) {
+        self.gated = gated
         self.first = first
         self.later = later
+    }
+
+    var calls: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return recorded
     }
 
     func waitForFirstCall() async {
@@ -44,10 +53,11 @@ final class GatedClient: DaemonClient, @unchecked Sendable {
         cont?.resume()
     }
 
-    private func takeFirst() -> Bool {
+    private func takeFirst(_ call: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        let isFirst = !firstTaken
-        firstTaken = true
+        recorded.append(call)
+        let isFirst = call == gated && !firstTaken
+        if isFirst { firstTaken = true }
         return isFirst
     }
 
@@ -65,15 +75,16 @@ final class GatedClient: DaemonClient, @unchecked Sendable {
         if hasEntered { lock.unlock(); cont.resume() } else { entered = cont; lock.unlock() }
     }
 
-    func status() async throws -> DaemonStatus {
-        guard takeFirst() else { return later }
+    private func answer(_ call: String) async throws -> DaemonStatus {
+        guard takeFirst(call) else { return later }
         await withCheckedContinuation { park($0) }
-        return first
+        return try first.get()
     }
 
-    func approve(_ requestID: String) async throws -> DaemonStatus { later }
-    func decline(_ requestID: String) async throws -> DaemonStatus { later }
-    func remove(_ phone: ApprovedPhone) async throws -> DaemonStatus { later }
+    func status() async throws -> DaemonStatus { try await answer("status") }
+    func approve(_ requestID: String) async throws -> DaemonStatus { try await answer("approve") }
+    func decline(_ requestID: String) async throws -> DaemonStatus { try await answer("decline") }
+    func remove(_ phone: ApprovedPhone) async throws -> DaemonStatus { try await answer("remove") }
 }
 
 func pending(_ id: String) -> PendingPhone {
@@ -149,7 +160,7 @@ final class AppModelTests: XCTestCase {
     }
 
     func testStaleRefreshDoesNotOverwriteNewerApproveReply() async {
-        let gated = GatedClient(first: status(pending: [pending("a")]), later: status())
+        let gated = GatedClient(first: .success(status(pending: [pending("a")])), later: status())
         let model = AppModel(client: gated)
         model.status = status(pending: [pending("a")])
         let slow = Task { await model.refresh() }
@@ -220,5 +231,49 @@ final class AppModelTests: XCTestCase {
         await model.refresh()
         XCTAssertNil(model.problem)
         XCTAssertNotNil(model.status)
+    }
+
+    func testActionInFlightIgnoresRepeatsAndRefreshesAndShowsItsError() async {
+        let gated = GatedClient(
+            gated: "approve", first: .failure(.refused("store write failed: disk full")),
+            later: status(pending: [pending("a")]))
+        let model = AppModel(client: gated)
+        model.status = status(pending: [pending("a")])
+        let click = Task { await model.approve(pending("a")) }
+        await gated.waitForFirstCall()
+        XCTAssertTrue(model.busy)
+        await model.approve(pending("a"))
+        await model.decline(pending("a"))
+        await model.refresh()
+        gated.releaseFirst()
+        await click.value
+        XCTAssertFalse(model.busy)
+        XCTAssertEqual(gated.calls, ["approve"], "a double click or a poll must not reach the daemon")
+        XCTAssertEqual(model.problem, "usbtetherd refused the request (store write failed: disk full).")
+    }
+
+    func testActionErrorSurvivesRefreshUntilStatusChanges() async {
+        let client = FakeClient(.success(status(pending: [pending("a")])))
+        let model = AppModel(client: client)
+        await model.refresh()
+        client.nextStatus = .failure(.refused("store write failed: disk full"))
+        await model.approve(pending("a"))
+        client.nextStatus = .success(status(pending: [pending("a")]))
+        await model.refresh()
+        XCTAssertEqual(model.problem, "usbtetherd refused the request (store write failed: disk full).")
+        client.nextStatus = .success(status())
+        await model.refresh()
+        XCTAssertNil(model.problem, "once the phone is gone the error is stale")
+    }
+
+    func testRefreshErrorIsClearedByTheNextRefresh() async {
+        let client = FakeClient(.success(status()))
+        let model = AppModel(client: client)
+        await model.refresh()
+        client.nextStatus = .failure(.timedOut)
+        await model.refresh()
+        client.nextStatus = .success(status())
+        await model.refresh()
+        XCTAssertNil(model.problem)
     }
 }

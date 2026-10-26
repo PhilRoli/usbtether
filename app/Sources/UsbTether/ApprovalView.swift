@@ -27,6 +27,7 @@ struct ApprovalView: View {
                     .keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier("declineButton")
             }
+            .disabled(model.busy)
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)

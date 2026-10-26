@@ -37,12 +37,16 @@ struct PreferencesView: View {
     }
 
     @ViewBuilder private var approvedList: some View {
-        let approved = model.status?.approved ?? []
-        if approved.isEmpty {
+        switch model.status?.approved {
+        case nil:
+            // Daemon unreachable or the request refused: the list is unknown, not empty.
+            Text("Unavailable until usbtetherd answers.")
+                .foregroundColor(.secondary)
+        case let approved? where approved.isEmpty:
             Text("No approved phones yet. Plug in a phone and turn on USB tethering.")
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-        } else {
+        case let approved?:
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(approved) { phone in
                     row(phone)
@@ -65,6 +69,7 @@ struct PreferencesView: View {
             }
             Spacer()
             Button("Remove") { Task { await model.remove(phone) } }
+                .disabled(model.busy)
                 .accessibilityIdentifier("removeButton-" + ids.replacingOccurrences(of: ":", with: "-"))
         }
     }

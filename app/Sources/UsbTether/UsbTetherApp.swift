@@ -9,8 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     /// The phone last rendered in the approval prompt; never re-read at close time.
     private var displayedPrompt: PendingPhone?
-    /// Set when the system announces logout, restart or shutdown.
-    private var poweringOff = false
+    /// When the system last announced logout, restart or shutdown. A logout can be cancelled
+    /// and nothing announces that, so the announcement only counts for `powerOffWindow`.
+    private var powerOffAnnounced: Date?
+    private static let powerOffWindow: TimeInterval = 60
 
     static func main() {
         let app = NSApplication.shared
@@ -37,7 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func willPowerOff(_ notification: Notification) {
-        poweringOff = true
+        powerOffAnnounced = Date()
     }
 
     /// Closing the window quits. If a prompt is on screen the close counts as "Not now" for
@@ -82,6 +84,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func isSystemQuit() -> Bool {
         let why = NSAppleEventManager.shared().currentAppleEvent?
             .attributeDescriptor(forKeyword: kAEQuitReason)
+        let poweringOff = powerOffAnnounced.map { -$0.timeIntervalSinceNow < Self.powerOffWindow } ?? false
         return poweringOff
             || isSystemQuitReason(why?.typeCodeValue)
             || isSystemQuitReason(why?.enumCodeValue)
