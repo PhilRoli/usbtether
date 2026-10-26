@@ -1,6 +1,7 @@
 name: Release
 
-# Releases are manual: push a vX.Y.Z[-suffix] tag. Prerelease tags skip the tap.
+# Releases are manual: push a vX.Y.Z tag on a commit that is on main, or a
+# vX.Y.Z-suffix prerelease tag on any commit (prereleases skip the tap).
 # workflow_dispatch only does a dry run (build).
 # If publish fails after the release was created (a failed asset upload leaves a
 # stray draft), delete only the release, keeping the tag:
@@ -35,11 +36,8 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: read
-    outputs:
-      version: ${{ steps.package.outputs.version }}
-      prerelease: ${{ steps.package.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
@@ -72,9 +70,8 @@ jobs:
           printf 'version=%s\nsha256=%s\n' "$VERSION" "$sha256" > build/release-info.txt
           echo "build/UsbTether-$VERSION.zip sha256 $sha256"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if [[ "$VERSION" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
           overwrite: true
@@ -83,6 +80,8 @@ jobs:
             build/release-info.txt
           if-no-files-found: error
 
+  # VERSION and PRERELEASE come from the tag here, never from build's outputs: build
+  # runs dependency build scripts, which can write to its $GITHUB_OUTPUT.
   publish:
     needs: build
     if: ${{ github.event_name == 'push' }}
@@ -90,17 +89,36 @@ jobs:
     permissions:
       contents: write
     env:
-      VERSION: ${{ needs.build.outputs.version }}
-      PRERELEASE: ${{ needs.build.outputs.prerelease }}
       TAG: ${{ github.ref_name }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v7
+      - name: Check release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]]; then
+            echo "Tag $TAG is not vMAJOR.MINOR.PATCH[-suffix]" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          if [[ "$VERSION" == *-* ]]; then PRERELEASE=true; else PRERELEASE=false; fi
+          # A full release reaches every `brew upgrade`: only commits already on main
+          # (and so through CI) qualify. Prereleases may come from a release branch.
+          if [ "$PRERELEASE" = false ]; then
+            status="$(gh api "repos/$GH_REPO/compare/main...$GITHUB_SHA" --jq .status)"
+            case "$status" in
+              identical|behind) ;;
+              *) echo "Tag $TAG ($GITHUB_SHA) is not on main (compare: $status)" >&2; exit 1 ;;
+            esac
+          fi
+          printf 'VERSION=%s\nPRERELEASE=%s\n' "$VERSION" "$PRERELEASE" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: scripts
           persist-credentials: false
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release
           path: dist
@@ -113,14 +131,14 @@ jobs:
           echo "$actual" > "$RUNNER_TEMP/sha256"
 
       - name: Verify tap token
-        if: ${{ needs.build.outputs.prerelease == 'false' }}
+        if: ${{ env.PRERELEASE == 'false' }}
         env:
           TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: '[ -n "$TOKEN" ] || { echo "HOMEBREW_TAP_TOKEN is not set" >&2; exit 1; }'
 
       - name: Checkout homebrew-tap
-        if: ${{ needs.build.outputs.prerelease == 'false' }}
-        uses: actions/checkout@v7
+        if: ${{ env.PRERELEASE == 'false' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: ${{ github.repository_owner }}/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -129,7 +147,7 @@ jobs:
 
       # Fail before publishing if the tap update cannot succeed.
       - name: Verify cask and tap push access
-        if: ${{ needs.build.outputs.prerelease == 'false' }}
+        if: ${{ env.PRERELEASE == 'false' }}
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
@@ -151,7 +169,7 @@ jobs:
           gh release create "$TAG" "dist/UsbTether-$VERSION.zip" "${args[@]}"
 
       - name: Update cask in tap
-        if: ${{ needs.build.outputs.prerelease == 'false' }}
+        if: ${{ env.PRERELEASE == 'false' }}
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |

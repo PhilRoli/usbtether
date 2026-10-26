@@ -50,7 +50,7 @@ The allowlist decides which phones are used; it is not authentication.
 
 ## Releasing
 
-Push a `vX.Y.Z` tag: the Release workflow tests, packages a universal build, publishes the GitHub release and updates the Homebrew cask in `PhilRoli/homebrew-tap`. Prerelease tags such as `v1.2.0-rc.1` publish a GitHub prerelease but skip the tap.
+Push a `vX.Y.Z` tag on a commit that is already on `main` (the workflow refuses any other): the Release workflow tests, packages a universal build, publishes the GitHub release and updates the Homebrew cask in `PhilRoli/homebrew-tap`. Prerelease tags such as `v1.2.0-rc.1` publish a GitHub prerelease but skip the tap.
 
 - The `HOMEBREW_TAP_TOKEN` secret is a fine-grained personal access token with Contents write access to the tap repository.
 - Running the workflow by hand (`workflow_dispatch`) is a dry run only: it builds and packages, and never releases or touches the tap.
