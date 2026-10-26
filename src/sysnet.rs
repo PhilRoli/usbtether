@@ -25,13 +25,27 @@ fn run(cmd: &str, args: &[&str]) -> io::Result<()> {
     Ok(())
 }
 
+/// Run an scutil script. scutil exits 0 even when a command fails and reports
+/// the failure on stdout instead ("Permission denied"); the commands used here
+/// print nothing on success, so any output at all is an error.
 fn scutil(script: &str) -> io::Result<()> {
     let mut child = Command::new("/usr/sbin/scutil")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
+    // Dropping stdin at the end of this statement gives scutil its EOF.
     child.stdin.take().unwrap().write_all(script.as_bytes())?;
-    child.wait()?;
+    let out = child.wait_with_output()?;
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let said = said.trim();
+    if !out.status.success() || !said.is_empty() {
+        return Err(io::Error::other(format!("scutil: {said} ({})", out.status)));
+    }
     Ok(())
 }
 
@@ -238,5 +252,12 @@ mod tests {
     #[test]
     fn empty_local_list_never_collides() {
         assert!(!lease_collides(&lease([10, 0, 0, 2], [10, 0, 0, 1]), &[]));
+    }
+
+    #[test]
+    fn scutil_reports_a_failed_command_despite_exit_status_0() {
+        let e = scutil("no_such_command\n").unwrap_err();
+        assert!(e.to_string().contains("no_such_command"), "{e}");
+        scutil("d.init\nd.add Probe 1\n").unwrap();
     }
 }
