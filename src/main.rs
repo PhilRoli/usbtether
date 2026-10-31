@@ -34,6 +34,10 @@ use discovery::Candidate;
 use gate::{Decision, Gate};
 
 const CONSOLE_POLL: Duration = Duration::from_secs(2);
+/// A session shorter than this counts as a link flap.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+const FLAP_DELAY_BASE: Duration = Duration::from_secs(2);
+const FLAP_DELAY_MAX: Duration = Duration::from_secs(60);
 const PIDFILE: &str = "/var/run/usbtetherd.pid";
 
 pub const VERSION: &str = match option_env!("USBTETHER_VERSION") {
@@ -331,6 +335,33 @@ fn supervise(ctx: &Mutex<Ctx>, handoff: &Mutex<Handoff<Candidate>>) {
     }
 }
 
+/// Back-off for a phone whose link keeps dropping. Re-claiming the RNDIS
+/// interface every second made a Samsung kernel panic in its gadget driver
+/// (NULL dereference in `eth_start_xmit` while the gadget was being rebuilt),
+/// so after the second short session in a row the daemon waits 2 s, then 4 s,
+/// 8 s and so on up to 60 s. A session that lasts 30 s or more resets it.
+#[derive(Default)]
+struct FlapGuard {
+    short_in_a_row: u32,
+}
+
+impl FlapGuard {
+    /// Record a finished session; return how long to wait before the next one.
+    fn after_session(&mut self, lasted: Duration) -> Duration {
+        if lasted >= STABLE_SESSION {
+            self.short_in_a_row = 0;
+            return Duration::ZERO;
+        }
+        self.short_in_a_row = self.short_in_a_row.saturating_add(1);
+        match self.short_in_a_row {
+            0 | 1 => Duration::ZERO,
+            n => FLAP_DELAY_BASE
+                .saturating_mul(1u32 << (n - 2).min(10))
+                .min(FLAP_DELAY_MAX),
+        }
+    }
+}
+
 /// What the session loop does once a session has ended.
 #[derive(Debug, PartialEq, Eq)]
 enum After {
@@ -359,7 +390,8 @@ fn after_session(ok: bool, quit: bool, revoked: bool) -> After {
 /// Run one phone session on this thread. A panic (bad input from a device)
 /// must not take the daemon down: unwinding drops the session's routes and
 /// DNS, and we go back to scanning.
-fn run_session(info: nusb::DeviceInfo, revoke: &AtomicBool, test: bool) {
+fn run_session(info: nusb::DeviceInfo, revoke: &AtomicBool, test: bool) -> Duration {
+    let started = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         session::run(info, &QUIT, revoke, test)
     }))
@@ -383,6 +415,7 @@ fn run_session(info: nusb::DeviceInfo, revoke: &AtomicBool, test: bool) {
         }
         (After::Retry, Ok(())) => {}
     }
+    started.elapsed()
 }
 
 fn main() {
@@ -451,6 +484,7 @@ fn main() {
             .expect("spawn supervisor")
     };
 
+    let mut flaps = FlapGuard::default();
     while !QUIT.load(Relaxed) {
         let finished = [
             supervisor.is_finished(),
@@ -487,7 +521,17 @@ fn main() {
         let mut fresh = discovery::scan();
         if let Some(i) = fresh_index(&cand.id, fresh.iter().map(|c| &c.id)) {
             // Neither lock is held while the session runs.
-            run_session(fresh.swap_remove(i).info, &revoke, test);
+            let lasted = run_session(fresh.swap_remove(i).info, &revoke, test);
+            // The hand-off stays busy while we wait, so nothing reconnects.
+            let wait = flaps.after_session(lasted);
+            if !wait.is_zero() && !QUIT.load(Relaxed) {
+                log!(
+                    "link keeps dropping ({} short sessions in a row); waiting {}s before reconnecting",
+                    flaps.short_in_a_row,
+                    wait.as_secs()
+                );
+                sleep_unless_quit(wait);
+            }
         }
         let mut h = handoff.lock().unwrap_or_else(|e| e.into_inner());
         ctx.lock().unwrap_or_else(|e| e.into_inner()).active = None;
@@ -651,6 +695,24 @@ mod tests {
         // An ended approval is neither a disconnect nor a retryable error.
         assert_eq!(after_session(false, false, true), After::Revoked);
         assert_eq!(after_session(true, false, true), After::Revoked);
+    }
+
+    #[test]
+    fn flapping_link_backs_off_and_a_stable_session_resets() {
+        let short = Duration::from_secs(1);
+        let secs = Duration::from_secs;
+        let mut g = FlapGuard::default();
+        assert_eq!(g.after_session(short), secs(0), "one drop is normal");
+        assert_eq!(g.after_session(short), secs(2));
+        assert_eq!(g.after_session(short), secs(4));
+        assert_eq!(g.after_session(short), secs(8));
+        for _ in 0..20 {
+            assert!(g.after_session(short) <= FLAP_DELAY_MAX);
+        }
+        assert_eq!(g.after_session(short), FLAP_DELAY_MAX);
+        assert_eq!(g.after_session(STABLE_SESSION), secs(0));
+        assert_eq!(g.after_session(short), secs(0), "streak restarted");
+        assert_eq!(g.after_session(short), secs(2));
     }
 
     const LOG_CHILD: &str = "USBTETHER_LOG_CHILD";
