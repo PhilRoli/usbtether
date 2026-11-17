@@ -67,11 +67,14 @@ public struct DaemonStatus: Decodable, Equatable, Sendable {
     public let phone: PhoneLink?
     public let pending: [PendingPhone]
     public let approved: [ApprovedPhone]
+    /// Absent when talking to a daemon older than the version field.
+    public let version: String?
 
-    public init(phone: PhoneLink?, pending: [PendingPhone], approved: [ApprovedPhone]) {
+    public init(phone: PhoneLink?, pending: [PendingPhone], approved: [ApprovedPhone], version: String? = nil) {
         self.phone = phone
         self.pending = pending
         self.approved = approved
+        self.version = version
     }
 }
 

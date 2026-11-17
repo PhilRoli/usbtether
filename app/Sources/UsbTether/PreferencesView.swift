@@ -6,6 +6,9 @@ struct PreferencesView: View {
     /// Reports the phone currently shown in the approval prompt (nil if none).
     var onPromptShown: (PendingPhone?) -> Void = { _ in }
 
+    private static let appVersion =
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(Presentation.statusLine(model.status))
@@ -22,6 +25,10 @@ struct PreferencesView: View {
             Text("Approved phones")
                 .font(.subheadline)
             approvedList
+            Text(versionLine)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .padding(16)
         .frame(width: 420)
@@ -34,6 +41,13 @@ struct PreferencesView: View {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
+    }
+
+    private var versionLine: String {
+        guard let daemon = model.status?.version else { return "App \(Self.appVersion)" }
+        return daemon == Self.appVersion
+            ? "Version \(Self.appVersion)"
+            : "App \(Self.appVersion), daemon \(daemon)"
     }
 
     @ViewBuilder private var approvedList: some View {

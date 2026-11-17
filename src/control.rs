@@ -85,6 +85,7 @@ fn status_reply(ctx: &Ctx) -> String {
         "phone": ctx.phone,
         "pending": pending,
         "approved": approved,
+        "version": crate::VERSION,
     })
     .to_string()
 }
@@ -375,7 +376,8 @@ mod tests {
         assert_eq!(a["pid"], 1);
         assert_eq!(a["serial"], "S1");
         assert_eq!(a["approved_at"], 42);
-        assert_eq!(v.as_object().unwrap().len(), 3);
+        assert_eq!(v["version"], crate::VERSION);
+        assert_eq!(v.as_object().unwrap().len(), 4);
         assert_eq!(p.as_object().unwrap().len(), 5);
         assert_eq!(a.as_object().unwrap().len(), 5);
 
