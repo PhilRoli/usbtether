@@ -35,8 +35,18 @@ const PACKET_FILTER: u32 = 0x0001 | 0x0002 | 0x0004 | 0x0008;
 
 pub const PACKET_HEADER_LEN: usize = 44;
 
-/// The most the phone may send us in one bulk transfer; also our RX buffer size.
+/// Our RX buffer size: the most we could receive in one bulk transfer.
 pub const RX_TRANSFER: usize = 16384;
+
+/// MaxTransferSize we announce by default. Samsung's u_ether switches to a
+/// multi-packet TX path (a global flag flipped from the control path, racing
+/// with the data path) whenever this is above 2048; on an S26 that path hit a
+/// NULL `req->buf` in `eth_start_xmit` and panicked the phone right after link
+/// up. 2048 keeps it in plain single-packet mode.
+const SINGLE_PACKET_TRANSFER: u32 = 2048;
+
+/// Set by `--multipacket` to announce `RX_TRANSFER` instead.
+pub static MULTIPACKET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const CTRL_TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -167,7 +177,12 @@ impl Control {
         let mut init = None;
         for attempt in 1..=3 {
             let id = self.id();
-            let m = msg(&[MSG_INIT, 24, id, 1, 0, RX_TRANSFER as u32]);
+            let max_transfer = if MULTIPACKET.load(std::sync::atomic::Ordering::Relaxed) {
+                RX_TRANSFER as u32
+            } else {
+                SINGLE_PACKET_TRANSFER
+            };
+            let m = msg(&[MSG_INIT, 24, id, 1, 0, max_transfer]);
             match self.command(&m, MSG_INIT_C) {
                 Ok(r) => {
                     init = Some(r);

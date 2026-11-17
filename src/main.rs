@@ -7,6 +7,8 @@
 //!
 //! Usage: sudo usbtetherd         run in the foreground (Ctrl+C to stop)
 //!        sudo usbtetherd --test  bring the link up but route only bound sockets over it
+//!        sudo usbtetherd --multipacket  let the phone batch frames per USB transfer
+//!                                       (off by default: it can panic Samsung kernels)
 
 mod control;
 mod devices;
@@ -427,12 +429,14 @@ fn main() {
         std::process::exit(1);
     }
     let mut test = false;
-    match std::env::args().nth(1).as_deref() {
-        None => {}
-        Some("--test") => test = true,
-        Some(other) => {
-            say!("usage: sudo usbtetherd [--test]   (unknown argument: {other})");
-            std::process::exit(2);
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--test" => test = true,
+            "--multipacket" => rndis::MULTIPACKET.store(true, Relaxed),
+            other => {
+                say!("usage: sudo usbtetherd [--test] [--multipacket]   (unknown argument: {other})");
+                std::process::exit(2);
+            }
         }
     }
     if let Some(pid) = running_pid() {
