@@ -434,7 +434,9 @@ fn main() {
             "--test" => test = true,
             "--multipacket" => rndis::MULTIPACKET.store(true, Relaxed),
             other => {
-                say!("usage: sudo usbtetherd [--test] [--multipacket]   (unknown argument: {other})");
+                say!(
+                    "usage: sudo usbtetherd [--test] [--multipacket]   (unknown argument: {other})"
+                );
                 std::process::exit(2);
             }
         }
